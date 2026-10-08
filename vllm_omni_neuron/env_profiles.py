@@ -98,3 +98,5 @@ class Wan22EnvProfile:
 
 WAN22_T2V = Wan22EnvProfile()
 WAN22_I2V = Wan22EnvProfile()
+# MiniMax-H3 compiles and runs under the same settings as Wan2.2.
+MINIMAX_H3 = Wan22EnvProfile()

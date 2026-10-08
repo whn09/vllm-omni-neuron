@@ -1,0 +1,988 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MiniMax-H3 joint video+audio transformer for Neuron, following the plugin's DiT pattern.
+
+Raw ``nn.Parameter`` plus vLLM-Neuron weight loaders (no CPL/RPL modules), as in the Wan2.2 port.
+
+MiniMax-H3 runs one stack of 50 blocks over a **single packed 1-D sequence** holding text,
+keyframe conditioning, target audio and target video rows at once. Attention is full
+self-attention over that sequence; there is no cross-attention and no per-modality block weights.
+Modality-specific behaviour comes only from the two input patch projections, the per-row AdaLN
+modality tag and the two output heads.
+
+Three things differ from a straight transcription of
+``diffusers.models.transformers.transformer_minimax_h3``, all because a traced NEFF wants static
+shapes and hates gathers:
+
+1. **The packed sequence is built by `cat`, not `index_copy`.** The released row order is
+   ``[text | keyframe conditions | target audio | target video]`` — contiguous blocks whose
+   sizes are known before the trace.
+
+2. **AdaLN modulation is applied per *run*, not per row.** The reference gathers six
+   ``(seq_len, hidden_size)`` modulation tensors out of the ``(timestep, modality)`` table in
+   every block, though the table only ever holds a handful of distinct rows. The sequence is
+   decomposed host-side into ``(start, end)`` runs over which the row is constant, the
+   ``(num_runs, hidden_size)`` slice is gathered once, and each run is modulated by a broadcast.
+   See `packing.build_row_runs`.
+
+3. **Only the rows that reach an output head run through the output stack.** Both heads are
+   row-wise linear maps, so slicing first is identical to the reference's "project every row,
+   then `index_select`", and the text rows skip `norm_out` entirely.
+
+Parallelism: heads are sharded over the TP group (56 heads, so TP is 1, 2, 4, 7 or 8) and the
+packed sequence over the CP group, whose ranks all-gather keys and values for attention; see
+`parallel` and `attention`.
+
+The mixed-precision contract of the checkpoint is preserved: the two patch projections, the
+timestep MLP and the two output heads stay float32 while the block stack (including the AdaLN
+projections) runs bfloat16.
+"""
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.weight_loader import (
+    SafetensorsWeightLoader,
+    fused_qkv_weight_loader,
+    set_weight_loader,
+    sharding_weight_loader,
+)
+
+from vllm_omni_neuron.diffusion.distributed.parallel_state import (
+    get_cp_group,
+    register_replica_groups,
+)
+from vllm_omni_neuron.diffusion.models.minimax_h3 import parallel
+from vllm_omni_neuron.diffusion.models.minimax_h3.attention import (
+    context_parallel_attention,
+    local_attention,
+)
+
+# MiniMax-H3 tags every row of the packed sequence with the modality it belongs to and
+# keeps one set of AdaLN modulation parameters per (timestep, modality) pair:
+# 0 = video, 1 = text, 2 = audio.
+MINIMAX_H3_MODALITY_NUM = 3
+
+# The parameters the checkpoint ships in float32 while the block stack is bfloat16.
+# Matched as substrings of the parameter name, exactly as diffusers'
+# `_keep_in_fp32_modules` does, so `proj_in` / `proj_out` also cover the audio heads.
+_KEEP_IN_FP32 = ("proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out")
+
+
+@dataclass
+class MiniMaxH3Config:
+    """Configuration of `NeuronMiniMaxH3Transformer3DModel`.
+
+    Mirrors the diffusers config of the released checkpoints. Note that
+    ``num_attention_heads * attention_head_dim`` (7168) is *larger* than ``hidden_size``
+    (5376) in MiniMax-H3 — the attention inner dimension is not the residual stream.
+    """
+
+    num_attention_heads: int = 56
+    attention_head_dim: int = 128
+    hidden_size: int = 5376
+    num_layers: int = 50
+    num_refiner_layers: int = 2
+    ffn_dim: int = 14336
+    in_channels: int = 24
+    audio_in_channels: int = 32
+    patch_size: tuple[int, int, int] = (1, 2, 2)
+    text_dim: int = 5120
+    freq_dim: int = 256
+    time_embed_hidden_dim: int = 5376
+    time_embed_dim: int = 2688
+    rope_freq_dim: int = 16
+    rope_theta: float = 10000.0
+    norm_eps: float = 1e-5
+    qk_norm_eps: float = 1e-5
+    final_norm_eps: float = 1e-5
+
+
+@dataclass
+class MiniMaxH3RowRuns:
+    """The static row geometry one compiled graph serves.
+
+    Attributes:
+        num_text_rows: Length of the leading text block.
+        num_condition_rows: Length of the keyframe conditioning block.
+        num_audio_rows: Length of the audio block (both stereo channels).
+        num_video_rows: Length of the target video block.
+        runs: ``(start, end)`` spans of the full sequence over which the
+            ``(timestep, modality)`` pair — and hence the AdaLN table row — is constant.
+        num_timesteps: Length of the distinct-timestep table every step is padded to.
+    """
+
+    num_text_rows: int
+    num_condition_rows: int
+    num_audio_rows: int
+    num_video_rows: int
+    runs: tuple[tuple[int, int], ...]
+    num_timesteps: int
+    media_runs: tuple[tuple[int, int], ...] = field(init=False)
+
+    def __post_init__(self):
+        # The media suffix — everything the two output heads read — is
+        # `[conditions | audio | video]`, three spans each uniform in its timestep.
+        condition_end = self.num_condition_rows
+        audio_end = condition_end + self.num_audio_rows
+        video_end = audio_end + self.num_video_rows
+        self.media_runs = ((0, condition_end), (condition_end, audio_end), (audio_end, video_end))
+
+    @property
+    def sequence_length(self) -> int:
+        return (
+            self.num_text_rows
+            + self.num_condition_rows
+            + self.num_audio_rows
+            + self.num_video_rows
+        )
+
+
+# ===================================================================
+# Weight loader helpers
+# ===================================================================
+
+
+def _col_weight_loader(shard_size, num_shards):
+    """Column-parallel weight loader: shard the output dim (transposed storage)."""
+    return sharding_weight_loader(
+        shard_dim=1,
+        shard_size=shard_size,
+        num_shards=num_shards,
+        is_storage_transposed=True,
+    )
+
+
+def _col_bias_loader(shard_size, num_shards):
+    """Column-parallel bias loader: shard along dim 0."""
+    return sharding_weight_loader(shard_dim=0, shard_size=shard_size, num_shards=num_shards)
+
+
+def _row_weight_loader(shard_size, num_shards):
+    """Row-parallel weight loader: shard the input dim (transposed storage)."""
+    return sharding_weight_loader(
+        shard_dim=0,
+        shard_size=shard_size,
+        num_shards=num_shards,
+        is_storage_transposed=True,
+    )
+
+
+def _row_bias_loader(tp_size):
+    """Row-parallel bias loader: pre-divide by tp_size.
+
+    Each rank adds ``bias / tp_size`` before the all-reduce, so the sum over ranks
+    restores exactly the original bias. The GPT-OSS `scaled_bias_loader` pattern from
+    vllm-neuron.
+    """
+
+    def transform(slices, rank):
+        assert len(slices) == 1
+        return slices[0][:] / tp_size
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _gated_half_weight_loader(half: int, inner_dim: int, shard_size: int, num_shards: int):
+    """Column-parallel loader for one half of a fused SwiGLU projection.
+
+    The converted checkpoint stores ``ff.net.0.proj.weight`` as one
+    ``(2 * ffn_dim, hidden_size)`` tensor holding ``[value; gate]`` — diffusers' `SwiGLU`
+    order, which the conversion script produces by swapping the reference's
+    ``[gate; value]``. Splitting it into two parameters here keeps the fused checkpoint
+    key while giving the traced graph two plain matmuls instead of a `chunk`, and lets
+    each half be sharded independently over the TP ranks.
+
+    Args:
+        half: 0 for the value half, 1 for the gate half.
+        inner_dim: ``ffn_dim``, the size of one half.
+        shard_size: ``ffn_dim // tp_size``.
+        num_shards: TP world size.
+    """
+
+    def transform(slices, rank):
+        assert len(slices) == 1
+        start = half * inner_dim + (rank % num_shards) * shard_size
+        # The checkpoint is `(2 * ffn_dim, hidden_size)`; the parameter is
+        # `(hidden_size, shard_size)`, hence the transpose.
+        return slices[0][start : start + shard_size, :].T
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+# ===================================================================
+# Primitives
+# ===================================================================
+
+
+class RMSNorm(nn.Module):
+    """RMSNorm over the last dimension, reduced in float32.
+
+    The residual stream and the per-head query/key norms are both unsharded along the
+    normalized axis (the residual stream is replicated across TP ranks and the head
+    dimension is never split), so no cross-rank reduction is needed here — unlike the
+    Wan port's `DistributedRMSNorm`.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (hidden_states * self.weight.float()).to(input_dtype)
+
+
+def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
+
+    ``hidden_states`` is ``(batch_size, seq_len, num_heads, head_dim)`` and ``cos`` /
+    ``sin`` are ``(seq_len, rotary_dim)`` with ``rotary_dim = 2 * 3 * rope_freq_dim`` —
+    96 of the 128 head channels for the released config.
+    """
+    rotary_dim = cos.shape[-1]
+    hidden_states_rotary = hidden_states[..., :rotary_dim]
+    hidden_states_pass = hidden_states[..., rotary_dim:]
+
+    cos = cos.to(hidden_states.dtype)[None, :, None, :]
+    sin = sin.to(hidden_states.dtype)[None, :, None, :]
+    # `tensor_split` rather than `chunk`: XLA mislowers `split` on some axes
+    # (pytorch/xla#8640) and `tensor_split` takes indices, which lowers correctly.
+    x1, x2 = torch.tensor_split(hidden_states_rotary, [rotary_dim // 2], dim=-1)
+    hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
+    hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
+    return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1)
+
+
+def _modulate_runs(
+    hidden_states: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    runs: tuple[tuple[int, int], ...],
+) -> torch.Tensor:
+    """Apply ``h * (1 + scale) + shift`` with one ``(1, hidden_size)`` row per run.
+
+    ``shift`` / ``scale`` are ``(num_runs, hidden_size)`` — already reduced to one row per
+    run — so each span is modulated by a broadcast instead of a per-row gather out of
+    the full ``(timestep, modality)`` table.
+    """
+    parts = []
+    for index, (start, end) in enumerate(runs):
+        segment = hidden_states[:, start:end]
+        parts.append(segment * (1.0 + scale[index : index + 1]) + shift[index : index + 1])
+    return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
+
+# ===================================================================
+# Model classes
+# ===================================================================
+
+
+class MiniMaxH3FeedForward(nn.Module):
+    """TP-enabled SwiGLU feed-forward with raw ``nn.Parameter``.
+
+    ``value * silu(gate)`` then the down projection, matching diffusers' `SwiGLU` inside
+    `FeedForward` — which is the order the converted checkpoint stores (see
+    `_gated_half_weight_loader`). All three projections are bias-free in MiniMax-H3.
+    """
+
+    def __init__(self, hidden_size: int, ffn_dim: int):
+        super().__init__()
+        tp_size = parallel.tp_size()
+        self.tp_size = tp_size
+        inner_per_rank = ffn_dim // tp_size
+
+        self.value_proj_weight = nn.Parameter(torch.empty(hidden_size, inner_per_rank))
+        set_weight_loader(
+            self.value_proj_weight,
+            _gated_half_weight_loader(0, ffn_dim, inner_per_rank, tp_size),
+        )
+        self.gate_proj_weight = nn.Parameter(torch.empty(hidden_size, inner_per_rank))
+        set_weight_loader(
+            self.gate_proj_weight,
+            _gated_half_weight_loader(1, ffn_dim, inner_per_rank, tp_size),
+        )
+        self.down_proj_weight = nn.Parameter(torch.empty(inner_per_rank, hidden_size))
+        set_weight_loader(self.down_proj_weight, _row_weight_loader(inner_per_rank, tp_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        value = hidden_states @ self.value_proj_weight
+        gate = hidden_states @ self.gate_proj_weight
+        output = (value * F.silu(gate)) @ self.down_proj_weight
+        if self.tp_size > 1:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+        return output
+
+
+class MiniMaxH3Attention(nn.Module):
+    """Full self-attention over the packed sequence, with a fused QKV projection.
+
+    Sharded over heads, so ``num_attention_heads`` (56) must be divisible by the TP world size.
+    The per-head query/key norms normalize ``attention_head_dim``, which is never split, so they
+    stay local. Under context parallelism the rank holds one shard of the rows and attends to the
+    whole sequence over all-gathered keys and values; see `attention.context_parallel_attention`.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        qk_norm_eps: float = 1e-5,
+        sequence_is_sharded: bool = True,
+    ):
+        super().__init__()
+        self.head_dim = attention_head_dim
+        # The token refiner runs on the replicated text stream *before* the sequence split, so
+        # its attention is local even under CP.
+        self.sequence_is_sharded = sequence_is_sharded
+        tp_size = parallel.tp_size()
+        if num_attention_heads % tp_size:
+            raise ValueError(
+                f"MiniMax-H3 shards attention over its {num_attention_heads} heads, which "
+                f"a tensor-parallel size of {tp_size} does not divide."
+            )
+        self.tp_size = tp_size
+        self.num_heads = num_attention_heads // tp_size
+        tp_inner_dim = self.num_heads * attention_head_dim
+
+        # Fused QKV: `(hidden_size, 3 * tp_inner_dim)`. MHA, so q == k == v per rank.
+        self.qkv_split = [tp_inner_dim, 2 * tp_inner_dim]
+        self.qkv_proj_weight = nn.Parameter(torch.empty(hidden_size, 3 * tp_inner_dim))
+        set_weight_loader(
+            self.qkv_proj_weight,
+            fused_qkv_weight_loader(
+                q_size=tp_inner_dim,
+                kv_size=tp_inner_dim,
+                shard_dim=1,
+                num_shards=tp_size,
+                is_storage_transposed=True,
+            ),
+        )
+
+        self.norm_q = RMSNorm(attention_head_dim, eps=qk_norm_eps)
+        self.norm_k = RMSNorm(attention_head_dim, eps=qk_norm_eps)
+
+        self.o_proj_weight = nn.Parameter(torch.empty(tp_inner_dim, hidden_size))
+        set_weight_loader(self.o_proj_weight, _row_weight_loader(tp_inner_dim, tp_size))
+
+        self.scale = 1.0 / (attention_head_dim**0.5)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb=None,
+        cp_context: "_CPContext | None" = None,
+    ) -> torch.Tensor:
+        qkv = torch.matmul(hidden_states, self.qkv_proj_weight)
+        query, key, value = torch.tensor_split(qkv, self.qkv_split, dim=-1)
+
+        # Token-major `[B, S, N, D]` throughout: the layout both attention kernels take.
+        query = query.unflatten(-1, (self.num_heads, self.head_dim))
+        key = key.unflatten(-1, (self.num_heads, self.head_dim))
+        value = value.unflatten(-1, (self.num_heads, self.head_dim))
+
+        # The reference norms after unflattening, i.e. per head — not over the fused
+        # inner dimension. Keep that order.
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        if rotary_emb is not None:
+            query = _apply_rotary_emb(query, *rotary_emb)
+            key = _apply_rotary_emb(key, *rotary_emb)
+
+        if cp_context is not None and self.sequence_is_sharded:
+            attn_output = context_parallel_attention(
+                query, key, value, self.scale, cp_context.group, cp_context.num_pad
+            )
+        else:
+            attn_output = local_attention(query, key, value, self.scale)
+
+        output = torch.matmul(attn_output.flatten(2), self.o_proj_weight)
+        if self.tp_size > 1:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+        return output
+
+
+@dataclass
+class _CPContext:
+    """What a sharded attention layer needs to know about the CP split. Built once per forward."""
+
+    group: object
+    num_pad: int
+
+
+class MiniMaxH3AdaLayerNormModulation(nn.Module):
+    """Projects the shared timestep embedding into one block's six modulation tensors.
+
+    ``(num_timesteps, time_embed_dim)`` -> six ``(num_timesteps * 3, hidden_size)``
+    tensors in the diffusers ``shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
+    gate_mlp`` order, the table rows laid out ``[t0_mod0, t0_mod1, t0_mod2, t1_mod0,
+    ...]`` — what ``timestep_index * 3 + tag`` addresses.
+
+    At 2688 -> 96768 this projection is 260M parameters, ~40% of the model once summed
+    over 50 blocks, so it has to be sharded. It is row-parallel: ``temb`` is small and
+    replicated, the input dim is split, and the all-reduce output is only
+    ``(num_timesteps * 3, 6 * hidden_size)`` — a few hundred kilobytes, versus the
+    full-width all-gather a column-parallel split would need.
+    """
+
+    def __init__(self, time_embed_dim: int, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = parallel.tp_size()
+        self.tp_size = tp_size
+        in_per_rank = time_embed_dim // tp_size
+        out_features = 6 * hidden_size * MINIMAX_H3_MODALITY_NUM
+
+        self.linear_weight = nn.Parameter(torch.empty(in_per_rank, out_features))
+        set_weight_loader(self.linear_weight, _row_weight_loader(in_per_rank, tp_size))
+        self.linear_bias = nn.Parameter(torch.empty(out_features))
+        if tp_size > 1:
+            set_weight_loader(self.linear_bias, _row_bias_loader(tp_size))
+
+    def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # The activation runs at `temb`'s own precision — float32, since `time_embedder`
+        # is a float32 module in this mixed-precision checkpoint — and only its result is
+        # cast down to the bfloat16 projection. Every block reads the same `temb`, so a
+        # rounding applied before the activation biases every block's modulation
+        # parameters identically at every sampling step, which accumulates coherently
+        # over the denoising trajectory.
+        activated = F.silu(temb).to(self.linear_weight.dtype)
+        # Row-parallel: each rank holds its slice of `time_embed_dim`, so slice the
+        # replicated activation to match before the local matmul.
+        rank = parallel.tp_rank()
+        in_per_rank = self.linear_weight.shape[0]
+        activated = activated[:, rank * in_per_rank : (rank + 1) * in_per_rank]
+        temb = torch.matmul(activated, self.linear_weight) + self.linear_bias
+        if self.tp_size > 1:
+            dist.all_reduce(temb, op=dist.ReduceOp.SUM, group=parallel.tp_device_group())
+        temb = temb.view(-1, 6 * self.hidden_size)
+        return torch.tensor_split(temb, [self.hidden_size * i for i in range(1, 6)], dim=-1)
+
+
+class MiniMaxH3AdaLayerNormOut(nn.Module):
+    """Final norm of the media rows, shift/scale modulated per timestep.
+
+    Same layout and checkpoint keys as diffusers' `AdaLayerNormContinuous` (a `norm`
+    plus a `linear` to ``2 * hidden_size``), with MiniMax-H3's two specifics: the
+    modulation table holds one row per *timestep* — not per batch item — and the two
+    halves are ``shift`` then ``scale``.
+    """
+
+    def __init__(self, hidden_size: int, time_embed_dim: int, eps: float):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.norm = RMSNorm(hidden_size, eps=eps)
+        # 2688 -> 10752 is small enough to leave replicated; sharding it would cost an
+        # extra collective per step for ~30 MB of weights.
+        self.linear = nn.Linear(time_embed_dim, 2 * hidden_size, bias=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        runs: tuple[tuple[int, int], ...],
+        run_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        # As in `MiniMaxH3AdaLayerNormModulation`: activate at `temb`'s precision, cast
+        # to the projection's dtype after.
+        shift, scale = self.linear(F.silu(temb).to(self.linear.weight.dtype)).chunk(2, dim=-1)
+        shift = shift.index_select(0, run_rows).to(hidden_states.dtype)
+        scale = scale.index_select(0, run_rows).to(hidden_states.dtype)
+        # The modulation stays at the block stack's precision; the caller casts to the
+        # output heads' dtype.
+        return _modulate_runs(self.norm(hidden_states), shift, scale, runs)
+
+
+class MiniMaxH3TokenRefinerBlock(nn.Module):
+    """Plain pre-norm block refining the projected text stream. No AdaLN, no rotary."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_dim: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
+        self.attn = MiniMaxH3Attention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            qk_norm_eps=qk_norm_eps,
+            # The refiner runs before the sequence split, on the replicated text stream, so
+            # there is nothing to gather here — every rank already holds every text row.
+            sequence_is_sharded=False,
+        )
+        self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
+        self.ff = MiniMaxH3FeedForward(hidden_size, ffn_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
+        hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
+        return hidden_states
+
+
+class MiniMaxH3TokenRefiner(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_dim: int,
+        num_layers: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+        final_norm_eps: float,
+    ):
+        super().__init__()
+        self.refiner_blocks = nn.ModuleList(
+            [
+                MiniMaxH3TokenRefinerBlock(
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                    ffn_dim=ffn_dim,
+                    norm_eps=norm_eps,
+                    qk_norm_eps=qk_norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = RMSNorm(hidden_size, eps=final_norm_eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for block in self.refiner_blocks:
+            hidden_states = block(hidden_states)
+        return self.final_norm(hidden_states)
+
+
+class MiniMaxH3TransformerBlock(nn.Module):
+    """Pre-norm self-attention and feed-forward, each AdaLN-modulated per row run."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_dim: int,
+        time_embed_dim: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
+        self.attn = MiniMaxH3Attention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            qk_norm_eps=qk_norm_eps,
+        )
+        self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
+        self.ff = MiniMaxH3FeedForward(hidden_size, ffn_dim)
+        self.adaln_proj = MiniMaxH3AdaLayerNormModulation(
+            time_embed_dim=time_embed_dim, hidden_size=hidden_size
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        runs: tuple[tuple[int, int], ...],
+        run_rows: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        cp_context: _CPContext | None = None,
+    ) -> torch.Tensor:
+        modulation = self.adaln_proj(temb)
+        # One row per run instead of one per sequence row: the six table lookups shrink
+        # from `(seq_len, hidden_size)` to `(num_runs, hidden_size)`.
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            tensor.index_select(0, run_rows).to(hidden_states.dtype) for tensor in modulation
+        )
+
+        residual = hidden_states
+        norm_hidden_states = _modulate_runs(
+            self.norm1(hidden_states), shift_msa, scale_msa, runs
+        )
+        attn_output = self.attn(norm_hidden_states, rotary_emb, cp_context)
+        hidden_states = residual + _gate_runs(attn_output, gate_msa, runs)
+
+        residual = hidden_states
+        norm_hidden_states = _modulate_runs(
+            self.norm2(hidden_states), shift_mlp, scale_mlp, runs
+        )
+        ff_output = self.ff(norm_hidden_states)
+        hidden_states = residual + _gate_runs(ff_output, gate_mlp, runs)
+
+        return hidden_states
+
+
+def _pad_rows(tensor: torch.Tensor, dim: int, length: int) -> torch.Tensor:
+    """``tensor`` extended along ``dim`` to ``length`` rows with zeros."""
+    shape = list(tensor.shape)
+    shape[dim] = length - tensor.shape[dim]
+    return torch.cat(
+        [tensor, torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)], dim=dim
+    )
+
+
+def _gate_runs(
+    hidden_states: torch.Tensor, gate: torch.Tensor, runs: tuple[tuple[int, int], ...]
+) -> torch.Tensor:
+    """Scale each run of ``hidden_states`` by its ``(1, hidden_size)`` gate row."""
+    if len(runs) == 1:
+        return hidden_states * gate[0:1]
+    parts = [
+        hidden_states[:, start:end] * gate[index : index + 1]
+        for index, (start, end) in enumerate(runs)
+    ]
+    return torch.cat(parts, dim=1)
+
+
+class NeuronMiniMaxH3Transformer3DModel(nn.Module):
+    """MiniMax-H3 joint video+audio transformer for Neuron.
+
+    Raw ``nn.Parameter`` with TP weight loaders throughout. See the module docstring for
+    the three deliberate departures from the diffusers reference.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.config = MiniMaxH3Config(
+            **{k: v for k, v in kwargs.items() if k in MiniMaxH3Config.__dataclass_fields__}
+        )
+        config = self.config
+        if isinstance(config.patch_size, list):
+            config.patch_size = tuple(config.patch_size)
+
+        video_patch_dim = config.in_channels * (
+            config.patch_size[0] * config.patch_size[1] * config.patch_size[2]
+        )
+        self.video_patch_dim = video_patch_dim
+
+        self.cp_size = parallel.cp_size()
+        self.cp_rank = parallel.cp_rank()
+        # Make the TP/CP groups resolvable to their full replica-group partitions so the
+        # torch-native backend can legalize the collectives for SPMD compilation.
+        register_replica_groups(tp_size=parallel.tp_size(), cp_size=self.cp_size)
+        # Resolved here rather than in `forward`: a Python-side lookup Dynamo cannot trace.
+        self.cp_group = get_cp_group() if self.cp_size > 1 else None
+
+        # 1. Per-modality input projections. Small and float32 in the checkpoint, so
+        # left replicated.
+        self.proj_in = nn.Linear(video_patch_dim, config.hidden_size, bias=True)
+        self.audio_proj_in = nn.Linear(config.audio_in_channels, config.hidden_size, bias=True)
+        self.context_embedder = nn.Linear(config.text_dim, config.hidden_size, bias=True)
+
+        # 2. Timestep MLP, shared by every AdaLN projection. `(num_timesteps, freq_dim)`
+        # -> `(num_timesteps, time_embed_dim)`; tiny, so replicated.
+        self.time_embedder = nn.Module()
+        self.time_embedder.linear_1 = nn.Linear(config.freq_dim, config.time_embed_hidden_dim)
+        self.time_embedder.linear_2 = nn.Linear(
+            config.time_embed_hidden_dim, config.time_embed_dim
+        )
+
+        # 3. Text stream refiner.
+        self.token_refiner = MiniMaxH3TokenRefiner(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            attention_head_dim=config.attention_head_dim,
+            ffn_dim=config.ffn_dim,
+            num_layers=config.num_refiner_layers,
+            norm_eps=config.norm_eps,
+            qk_norm_eps=config.qk_norm_eps,
+            final_norm_eps=config.final_norm_eps,
+        )
+
+        # 4. The block stack.
+        self.transformer_blocks = nn.ModuleList(
+            [
+                MiniMaxH3TransformerBlock(
+                    hidden_size=config.hidden_size,
+                    num_attention_heads=config.num_attention_heads,
+                    attention_head_dim=config.attention_head_dim,
+                    ffn_dim=config.ffn_dim,
+                    time_embed_dim=config.time_embed_dim,
+                    norm_eps=config.norm_eps,
+                    qk_norm_eps=config.qk_norm_eps,
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+
+        # 5. Shared output norm and the two per-modality heads.
+        self.norm_out = MiniMaxH3AdaLayerNormOut(
+            hidden_size=config.hidden_size,
+            time_embed_dim=config.time_embed_dim,
+            eps=config.final_norm_eps,
+        )
+        self.proj_out = nn.Linear(config.hidden_size, video_patch_dim, bias=True)
+        self.audio_proj_out = nn.Linear(config.hidden_size, config.audio_in_channels, bias=True)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype of the block stack — the model's nominal precision.
+
+        Not `proj_in.weight.dtype`: the patch projections and the two heads stay float32
+        in this mixed-precision checkpoint.
+        """
+        return self.transformer_blocks[0].attn.qkv_proj_weight.dtype
+
+    def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal timestep embedding plus the MLP, in the timestep MLP's precision.
+
+        Timesteps are consumed unscaled in ``[0, 1]``. This reproduces diffusers'
+        `Timesteps(freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)` followed by
+        `TimestepEmbedding`, written out rather than imported so the traced graph holds
+        no diffusers control flow.
+        """
+        half_dim = self.config.freq_dim // 2
+        exponent = -torch.log(torch.tensor(10000.0, dtype=torch.float32)) * torch.arange(
+            half_dim, dtype=torch.float32, device=timestep.device
+        )
+        # `downscale_freq_shift=0`, so the divisor is `half_dim` rather than
+        # `half_dim - shift`.
+        emb = torch.exp(exponent / half_dim)
+        emb = timestep.float()[:, None] * emb[None, :]
+        # `flip_sin_to_cos=True`: cosine first.
+        emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=-1)
+
+        emb = emb.to(self.time_embedder.linear_1.weight.dtype)
+        emb = self.time_embedder.linear_2(F.silu(self.time_embedder.linear_1(emb)))
+        return emb
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        audio_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        rotary_cos: torch.Tensor,
+        rotary_sin: torch.Tensor,
+        adaln_run_rows: torch.Tensor,
+        norm_out_run_rows: torch.Tensor,
+        row_runs: MiniMaxH3RowRuns,
+        return_dict: bool = False,
+    ):
+        """Run one denoising step over the packed sequence.
+
+        Args:
+            hidden_states: ``(B, num_condition_rows + num_video_rows, in_channels *
+                prod(patch_size))`` patchified video rows, conditioning rows first —
+                the order the packed layout places them in.
+            audio_hidden_states: ``(B, num_audio_rows, audio_in_channels)`` audio rows,
+                channel-major.
+            encoder_hidden_states: ``(B, num_text_rows, text_dim)`` text conditioning.
+            timestep: ``(num_timesteps,)`` distinct timestep values present in the
+                sequence, in ``[0, 1]`` and unscaled, padded to
+                ``row_runs.num_timesteps``.
+            rotary_cos: ``(seq_len, 2 * 3 * rope_freq_dim)`` cosines of the packed
+                ``(t, h, w)`` grid, precomputed on the host in float32. MiniMax-H3
+                builds the grid in float64 because video and audio share one rotary
+                clock, and Neuron has no float64 — so the grid is built and reduced to
+                cos/sin off-device, where it costs one pass per request.
+            rotary_sin: The matching sines.
+            adaln_run_rows: ``(num_runs,)`` row of the ``(timestep, modality)`` AdaLN
+                table each run of the sequence reads, i.e. ``timestep_index * 3 + tag``
+                sampled once per run.
+            norm_out_run_rows: ``(3,)`` row of the per-timestep `norm_out` table each
+                media run reads.
+            row_runs: The static row geometry, baked into the trace.
+            return_dict: Kept for signature parity with the reference; the Neuron
+                pipeline always consumes the tuple.
+
+        Returns:
+            ``(video_output, audio_output)`` — the video velocity in the row order of
+            ``hidden_states`` and the audio velocity in the row order of
+            ``audio_hidden_states``.
+        """
+        rotary_emb = (rotary_cos, rotary_sin)
+        num_condition_rows = row_runs.num_condition_rows
+
+        # 1. Project each modality and build the packed sequence. The checkpoint is
+        # mixed-precision (the two patch projections are float32 while
+        # `context_embedder` and the block stack are bfloat16), so every input is
+        # aligned with its projection's parameter dtype, mirroring the reference's
+        # explicit casts. The text stream sets the dtype of the packed sequence.
+        video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
+        audio_embeds = self.audio_proj_in(
+            audio_hidden_states.to(self.audio_proj_in.weight.dtype)
+        )
+        text_embeds = self.context_embedder(
+            encoder_hidden_states.to(self.context_embedder.weight.dtype)
+        )
+        text_embeds = self.token_refiner(text_embeds)
+
+        # `[text | keyframe conditions | target audio | target video]`. The reference
+        # scatters with three `index_copy` calls into a zero buffer; the row blocks are
+        # contiguous and statically sized, so a `cat` produces the same sequence without
+        # a scatter.
+        dtype = text_embeds.dtype
+        hidden_states = torch.cat(
+            [
+                text_embeds,
+                video_embeds[:, :num_condition_rows].to(dtype),
+                audio_embeds.to(dtype),
+                video_embeds[:, num_condition_rows:].to(dtype),
+            ],
+            dim=1,
+        )
+
+        # 2. One timestep embedding per distinct noise level. `temb` is shared by all
+        # AdaLN projections, which are bfloat16 while `time_embedder` is float32, so it
+        # stays at the time embedder's precision: each AdaLN module applies its own
+        # activation and casts to its projection's dtype afterwards.
+        temb = self._time_embedding(timestep)
+
+        # 2b. Under context parallelism, take this rank's rows. Everything in the block stack
+        # except attention is row-local, so the shard needs no communication until the ring.
+        runs = row_runs.runs
+        sequence_length = row_runs.sequence_length
+        cp_context = None
+        if self.cp_size > 1:
+            shard = parallel.sequence_shard(sequence_length, self.cp_size, self.cp_rank)
+            if shard.num_pad:
+                hidden_states = _pad_rows(hidden_states, 1, sequence_length + shard.num_pad)
+                rotary_emb = tuple(
+                    _pad_rows(table, 0, sequence_length + shard.num_pad) for table in rotary_emb
+                )
+            hidden_states = hidden_states[:, shard.start : shard.end].contiguous()
+            # The rotary tables are `(seq_len, ...)`, so they shard on dim 0 and have to cover
+            # exactly the rows Q now holds.
+            rotary_emb = tuple(table[shard.start : shard.end].contiguous() for table in rotary_emb)
+            runs, adaln_run_rows = parallel.shard_runs(
+                runs,
+                adaln_run_rows,
+                shard.start,
+                min(shard.end, sequence_length),
+                pad_to=shard.shard_length,
+            )
+            cp_context = _CPContext(group=self.cp_group, num_pad=shard.num_pad)
+
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, rotary_emb, cp_context)
+
+        if cp_context is not None:
+            # Back to full length before the output heads, so `norm_out`'s run spans stay in
+            # absolute coordinates.
+            hidden_states = cp_context.group.all_gather(hidden_states.contiguous(), dim=1)
+            hidden_states = hidden_states[:, :sequence_length]
+
+        # 3. Only the media rows reach a head, and both heads are row-wise linear maps,
+        # so slicing before the output stack is identical to the reference's "project
+        # every row, then `index_select`" — and drops the text rows from `norm_out` too.
+        media = hidden_states[:, row_runs.num_text_rows :]
+        media = self.norm_out(media, temb, row_runs.media_runs, norm_out_run_rows)
+
+        condition_end = num_condition_rows
+        audio_end = condition_end + row_runs.num_audio_rows
+        video_rows = torch.cat([media[:, :condition_end], media[:, audio_end:]], dim=1)
+        audio_rows = media[:, condition_end:audio_end]
+
+        video_output = self.proj_out(video_rows.to(self.proj_out.weight.dtype))
+        audio_output = self.audio_proj_out(audio_rows.to(self.audio_proj_out.weight.dtype))
+        return video_output, audio_output
+
+    # ---------------------------------------------------------------
+    # Weight loading
+    # ---------------------------------------------------------------
+
+    def _weight_mappings(self) -> dict[str, str | list[str]]:
+        """Model parameter name -> converted-diffusers checkpoint key(s).
+
+        Keys the port did not rename are omitted: the loader maps those by identity.
+        """
+        mappings: dict[str, str | list[str]] = {}
+
+        def attention_mappings(model_prefix: str, checkpoint_prefix: str) -> None:
+            mappings[f"{model_prefix}.qkv_proj_weight"] = [
+                f"{checkpoint_prefix}.to_q.weight",
+                f"{checkpoint_prefix}.to_k.weight",
+                f"{checkpoint_prefix}.to_v.weight",
+            ]
+            mappings[f"{model_prefix}.o_proj_weight"] = f"{checkpoint_prefix}.to_out.0.weight"
+
+        def feedforward_mappings(model_prefix: str, checkpoint_prefix: str) -> None:
+            # Both halves read the one fused `[value; gate]` tensor; the loaders pick
+            # their half (see `_gated_half_weight_loader`).
+            mappings[f"{model_prefix}.value_proj_weight"] = f"{checkpoint_prefix}.net.0.proj.weight"
+            mappings[f"{model_prefix}.gate_proj_weight"] = f"{checkpoint_prefix}.net.0.proj.weight"
+            mappings[f"{model_prefix}.down_proj_weight"] = f"{checkpoint_prefix}.net.2.weight"
+
+        for i in range(self.config.num_refiner_layers):
+            prefix = f"token_refiner.refiner_blocks.{i}"
+            attention_mappings(f"{prefix}.attn", f"{prefix}.attn")
+            feedforward_mappings(f"{prefix}.ff", f"{prefix}.ff")
+
+        for i in range(self.config.num_layers):
+            prefix = f"transformer_blocks.{i}"
+            attention_mappings(f"{prefix}.attn", f"{prefix}.attn")
+            feedforward_mappings(f"{prefix}.ff", f"{prefix}.ff")
+            mappings[f"{prefix}.adaln_proj.linear_weight"] = f"{prefix}.adaln_proj.linear.weight"
+            mappings[f"{prefix}.adaln_proj.linear_bias"] = f"{prefix}.adaln_proj.linear.bias"
+
+        return mappings
+
+    def _param_dtype(self, name: str) -> torch.dtype:
+        """The dtype a parameter is held in, honouring the mixed-precision contract."""
+        if any(pattern in name for pattern in _KEEP_IN_FP32):
+            return torch.float32
+        return self.dtype
+
+    def load_weights(
+        self,
+        model_name_or_path: str,
+        device: torch.device = torch.device("cpu"),
+        cache_dir: str | None = None,
+    ) -> None:
+        """Load a rank-sharded checkpoint to ``device`` with pipelined data movement.
+
+        ``dtype_override`` carries the mixed-precision contract *into* the loader. The
+        loader otherwise casts each tensor to the dtype its parameter was built with, and
+        every parameter here was built under `DiffusersPipelineLoader`'s
+        ``set_default_torch_dtype(od_config.dtype)`` — so the `_KEEP_IN_FP32` modules
+        would be downcast to bfloat16 and then cast back below, losing what they are kept
+        in float32 for.
+
+        Args:
+            model_name_or_path: HuggingFace model id or a directory of weights.
+            device: Device to load the weights to.
+            cache_dir: Optional download cache when loading from the Hub.
+        """
+        # Weights are sharded along the head / ffn axis only, so the slice is selected by the
+        # rank within its TP group: every CP shard holds the same weights.
+        tp_size = parallel.tp_size()
+        tp_rank = parallel.tp_rank()
+
+        checkpoint = SafetensorsCheckpoint(model_name_or_path, cache_dir)
+        dtype_override = {
+            name: self._param_dtype(name)
+            for name, _ in list(self.named_parameters()) + list(self.named_buffers())
+        }
+        load_result = checkpoint.load_sharded_pipelined(
+            tp_rank,
+            tp_size,
+            self,
+            self._weight_mappings(),
+            device,
+            dtype_override=dtype_override,
+        )
+        state_dict = load_result.state_dict
+
+        for name, tensor in state_dict.items():
+            target_dtype = self._param_dtype(name)
+            if tensor.dtype != target_dtype:
+                state_dict[name] = tensor.to(target_dtype)
+
+        self.load_state_dict(state_dict, strict=False, assign=True)

@@ -1,1 +1,11 @@
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+MiniMax-H3
+----------
+vllm_omni_neuron/diffusion/models/minimax_h3/ and
+vllm_omni_neuron/diffusion/distributed/autoencoders/autoencoder_kl_minimax_h3.py,
+autoencoder_minimax_h3_audio.py are Neuron ports of the MiniMax-H3 modeling code in
+Hugging Face diffusers (https://github.com/huggingface/diffusers, Apache License 2.0):
+models/transformers/transformer_minimax_h3.py, models/autoencoders/autoencoder_kl_minimax_h3*.py,
+schedulers/scheduling_minimax_h3.py and modular_pipelines/minimax_h3/, as of diffusers main in
+2026-09. The departures from the reference are documented in each module's docstring.
