@@ -18,6 +18,10 @@ stage_args:
       # The engine's dummy request is 512x512 / 1 step, a graph no real request uses; the
       # pipeline runs its own warmup instead (MINIMAX_H3_WARMUP).
       skip_warmup: true
+      # `ref2va` (image / video / audio references) runs the checkpoint's `transformer_ref/`;
+      # serve it from a stage of its own with:
+      # model_config:
+      #   task: ref2va
       parallel_config:
         # 56 attention heads: TP is 1, 2, 4, 7 or 8. Past 8 cores, ring_degree shards the
         # packed sequence (context parallelism).

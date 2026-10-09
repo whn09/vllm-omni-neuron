@@ -383,6 +383,153 @@ def build_packed_sequence(
     )
 
 
+def _frame_position_grid(latent_height: int, latent_width: int, patch_h: int, patch_w: int):
+    """The ``(h, w)`` rotary coordinates of one latent frame, and the width axis they came from."""
+    sqrt_area = np.sqrt(latent_height * latent_width)
+    height_grid = _spatial_position_grid(latent_height, patch_h, sqrt_area)
+    width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area)
+    grids = torch.meshgrid(height_grid, width_grid, indexing="ij")
+    return torch.stack([grid.reshape(-1) for grid in grids], dim=-1), width_grid
+
+
+def _fill_audio_positions(position_ids, rows: slice, num_audio_latents: int, rotary_time: float, width_grid):
+    """Place one channel-major audio block, pinned to the extremes of its own block's width grid."""
+    time = rotary_time + torch.arange(num_audio_latents, dtype=torch.float64)
+    position_ids[rows, 0] = time.repeat(MINIMAX_H3_AUDIO_CHANNELS)
+    position_ids[rows, 2] = torch.cat(
+        [
+            torch.full((num_audio_latents,), float(width_grid[0]), dtype=torch.float64),
+            torch.full((num_audio_latents,), float(width_grid[-1]), dtype=torch.float64),
+        ]
+    )
+
+
+def build_ref2va_packed_sequence(
+    text_token_tags: torch.Tensor,
+    reference_kinds: list[tuple[str, bool]],
+    condition_shapes: list[tuple[int, int, int]],
+    audio_condition_rows: list[int],
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    num_audio_latents: int,
+    patch_size: tuple[int, int, int],
+) -> MiniMaxH3PackedSequence:
+    """Build the ``[text | reference blocks | target audio | target video]`` layout of ``ref2va``.
+
+    Mirrors `diffusers`' ``MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence``.
+
+    Args:
+        text_token_tags: ``(num_text_tokens,)`` modality tag of every text row.
+        reference_kinds: ``(kind, has_audio)`` per reference in packed order; ``kind`` is
+            ``"image"``, ``"video"`` or ``"audio"``.
+        condition_shapes: ``(latent_frames, latent_height, latent_width)`` of every image and
+            video reference's latents, in packed order.
+        audio_condition_rows: Row count of every audio-bearing reference's soundtrack, in
+            packed order.
+        num_latent_frames, latent_height, latent_width: The target's latent geometry.
+        num_audio_latents: Target audio latents per channel.
+        patch_size: The transformer's ``(t, h, w)`` patch.
+    """
+    _, patch_h, patch_w = patch_size
+    num_text_tokens = text_token_tags.shape[0]
+    num_target_video_rows = num_latent_frames * (latent_height // patch_h) * (latent_width // patch_w)
+    num_target_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS
+    num_reference_video_rows = sum(f * (h // patch_h) * (w // patch_w) for f, h, w in condition_shapes)
+    num_reference_audio_rows = sum(audio_condition_rows)
+    sequence_length = (
+        num_text_tokens
+        + num_reference_video_rows
+        + num_reference_audio_rows
+        + num_target_audio_rows
+        + num_target_video_rows
+    )
+
+    position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
+    position_ids[:num_text_tokens, 0] = torch.arange(num_text_tokens, dtype=torch.float64)
+    target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+
+    # Reference blocks in request order. `rotary_time` is the shared audio/video clock: it starts
+    # where the text ends and every block pushes it forward by the time the block occupies.
+    visual_geometry = iter(condition_shapes)
+    audio_row_counts = iter(audio_condition_rows)
+    video_indices, audio_indices = [], []
+    cursor = num_text_tokens
+    rotary_time = float(num_text_tokens)
+    for kind, has_audio in reference_kinds:
+        if kind == "image":
+            frames, height, width = next(visual_geometry)
+            rows = slice(cursor, cursor + frames * (height // patch_h) * (width // patch_w))
+            cursor = rows.stop
+            video_indices.append(torch.arange(rows.start, rows.stop))
+            frame_grid, _ = _frame_position_grid(height, width, patch_h, patch_w)
+            position_ids[rows, 0] = rotary_time
+            position_ids[rows, 1:] = frame_grid
+            # An image takes one integer rotary slot, not a latent frame's 5/3 units.
+            rotary_time += 1.0
+        elif kind == "audio":
+            num_rows = next(audio_row_counts)
+            rows = slice(cursor, cursor + num_rows)
+            cursor = rows.stop
+            audio_indices.append(torch.arange(rows.start, rows.stop))
+            latents = num_rows // MINIMAX_H3_AUDIO_CHANNELS
+            _fill_audio_positions(position_ids, rows, latents, rotary_time, target_width_grid)
+            rotary_time += float(latents)
+        elif kind == "video":
+            # A soundtrack's rows go right before its video's and share their origin.
+            num_audio_rows = next(audio_row_counts) if has_audio else 0
+            audio_latents = num_audio_rows // MINIMAX_H3_AUDIO_CHANNELS
+            frames, height, width = next(visual_geometry)
+            frame_grid, width_grid = _frame_position_grid(height, width, patch_h, patch_w)
+            audio_rows = slice(cursor, cursor + num_audio_rows)
+            video_rows = slice(audio_rows.stop, audio_rows.stop + frames * frame_grid.shape[0])
+            cursor = video_rows.stop
+            audio_indices.append(torch.arange(audio_rows.start, audio_rows.stop))
+            video_indices.append(torch.arange(video_rows.start, video_rows.stop))
+            _fill_audio_positions(position_ids, audio_rows, audio_latents, rotary_time, width_grid)
+            frame_time = _temporal_position_grid(frames, rotary_time)
+            position_ids[video_rows, 0] = frame_time.repeat_interleave(frame_grid.shape[0])
+            position_ids[video_rows, 1:] = frame_grid.repeat(frames, 1)
+            # Summed sequentially, as the reference does at this call site (not pairwise, as
+            # `_temporal_position_span` does for the keyframe anchor).
+            video_span = sum(
+                _ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[index % len(_ROPE_FRAMES_PER_LATENT)]
+                for index in range(frames)
+            )
+            rotary_time += max(float(audio_latents), video_span)
+        else:
+            raise ValueError(f"A reference must be an 'image', a 'video' or an 'audio', got {kind!r}.")
+
+    # The generated rows share the origin the reference blocks left behind.
+    audio_start = cursor
+    video_start = audio_start + num_target_audio_rows
+    _fill_audio_positions(
+        position_ids, slice(audio_start, video_start), num_audio_latents, rotary_time, target_width_grid
+    )
+    frame_time = _temporal_position_grid(num_latent_frames, rotary_time)
+    position_ids[video_start:, 0] = frame_time.repeat_interleave(target_frame_grid.shape[0])
+    position_ids[video_start:, 1:] = target_frame_grid.repeat(num_latent_frames, 1)
+
+    video_indices = torch.cat(video_indices + [torch.arange(video_start, sequence_length)])
+    audio_indices = torch.cat(audio_indices + [torch.arange(audio_start, video_start)])
+    text_indices = torch.arange(num_text_tokens)
+    token_tags = torch.empty(sequence_length, dtype=torch.long)
+    token_tags[text_indices] = text_token_tags.to(torch.long)
+    token_tags[audio_indices] = MINIMAX_H3_AUDIO_TAG
+    token_tags[video_indices] = MINIMAX_H3_VIDEO_TAG
+
+    return MiniMaxH3PackedSequence(
+        sequence_length=sequence_length,
+        position_ids=position_ids,
+        token_tags=token_tags,
+        video_indices=video_indices,
+        audio_indices=audio_indices,
+        text_indices=text_indices,
+        num_condition_video_rows=num_reference_video_rows,
+        num_condition_audio_rows=num_reference_audio_rows,
+    )
+
+
 def build_rotary_tables(
     position_ids: torch.Tensor, rope_freq_dim: int, rope_theta: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -443,58 +590,6 @@ def build_row_timesteps(
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
-def build_row_runs(
-    layout: MiniMaxH3PackedSequence, num_timesteps: int
-) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
-    """Decompose the packed sequence into runs of constant ``(timestep, modality)``.
-
-    The AdaLN table is addressed by ``timestep_index * 3 + tag``, and both factors are
-    piecewise constant along the sequence: the modality tag changes only at a block
-    boundary or at the edge of a keyframe's vision block inside the text prompt, and the
-    timestep assignment is per block by construction (`build_row_timesteps`). So instead
-    of gathering a ``(seq_len, hidden_size)`` modulation tensor per block per step, the
-    graph can gather ``(num_runs, hidden_size)`` — a handful of rows — and broadcast each
-    over its run. `..models.neuron_minimax_h3_model` does exactly that.
-
-    Boundaries are placed **structurally** — at every block edge and every tag change —
-    rather than by comparing adjacent AdaLN rows for equality. Equality is not stable
-    across a schedule: the keyframe conditioning rows sit at ``max(t, 0.999)``, which
-    coincides with the video timestep on the first step and separates from it afterwards,
-    so an equality-merged decomposition would change its run count mid-schedule and
-    retrace the graph. Two adjacent runs that happen to carry the same table row are
-    harmless — just one broadcast that could have been merged.
-
-    Args:
-        layout: The packed layout.
-        num_timesteps: The fixed distinct-timestep table length (see `pad_num_timesteps`).
-
-    Returns:
-        The ``(start, end)`` spans, and the modality tag of each span. The per-run AdaLN
-        table rows are ``tag + 3 * timestep_index`` and depend on the step, so they are
-        built per step by `build_run_table_rows`.
-    """
-    if num_timesteps < 1:
-        raise ValueError(f"`num_timesteps` must be positive, got {num_timesteps}.")
-
-    tags = layout.token_tags.tolist()
-    num_text_rows = layout.text_indices.shape[0]
-    condition_start = num_text_rows
-    audio_start = condition_start + layout.num_condition_video_rows
-    video_start = audio_start + layout.audio_indices.shape[0]
-
-    boundaries = {0, condition_start, audio_start, video_start, layout.sequence_length}
-    # Tag changes inside the text block: MiniMax-H3 tags a keyframe's vision rows `0`
-    # even though they sit in the prompt, so those rows read a different AdaLN row.
-    for row in range(1, num_text_rows):
-        if tags[row] != tags[row - 1]:
-            boundaries.add(row)
-
-    edges = sorted(boundaries)
-    runs = tuple((start, end) for start, end in zip(edges[:-1], edges[1:]) if end > start)
-    run_tags = tuple(tags[start] for start, _ in runs)
-    return runs, run_tags
-
-
 def build_run_table_rows(
     runs: tuple[tuple[int, int], ...],
     run_tags: tuple[int, ...],
@@ -503,7 +598,7 @@ def build_run_table_rows(
     """Reduce a step's per-row timestep indices to the per-run AdaLN table rows.
 
     Args:
-        runs: The ``(start, end)`` spans from `build_row_runs`.
+        runs: The ``(start, end)`` spans from `DiTRowOrder.runs`.
         run_tags: The modality tag of each span.
         timestep_indices: ``(seq_len,)`` per-row index into the step's timestep table.
 
@@ -568,3 +663,94 @@ def pad_num_timesteps(
     # a duplicate keeps those activations in the range the checkpoint was trained on.
     pad = timestep[-1:].expand(num_timesteps - present)
     return torch.cat([timestep, pad]), timestep_indices
+
+
+def text_bucket_length(num_text_tokens: int, media_length: int, align: int) -> int:
+    """The prompt length the DiT graph is built for: the smallest ``>= num_text_tokens`` that
+    makes ``media_length + bucket`` a multiple of ``align``.
+
+    Every prompt length up to the bucket then shares one graph, and the packed sequence is
+    ``align``-row aligned, which the attention kernel runs fastest on. The padding is a few
+    hundred rows against tens of thousands of media rows. ``align <= 1`` disables bucketing.
+    """
+    if align <= 1:
+        return num_text_tokens
+    return num_text_tokens + (-(media_length + num_text_tokens)) % align
+
+
+@dataclass(frozen=True)
+class DiTRowOrder:
+    """Map a released layout to the DiT's ``[padding | text | conditions | audio | video]``.
+
+    The prompt is padded on the *left* up to its length bucket, so the rows that act as keys
+    stay one interval — ``[num_text_pad, sequence_length)`` — which the attention kernel's KV
+    bounds express; the rows that even out the CP shards trail the sequence and fall outside it
+    too. The media keep the released block order with all visual conditions first, then every
+    audio row (references first), then the target video — the order the DiT concatenates its
+    two input streams in. Attention sees rows only through their rotary positions, which are
+    built in the released order, so this is the reference's computation.
+
+    Attributes:
+        permutation: For each real DiT row, its index in the released order.
+        num_text_rows: The prompt bucket, padding included.
+        num_text_pad: Padding rows in front of the prompt.
+    """
+
+    permutation: torch.Tensor
+    num_text_rows: int
+    num_text_pad: int
+
+    @classmethod
+    def build(cls, layout: MiniMaxH3PackedSequence, num_text_rows: int) -> "DiTRowOrder":
+        num_text = int(layout.text_indices.shape[0])
+        if num_text_rows < num_text:
+            raise ValueError(f"A {num_text_rows}-row text bucket cannot hold {num_text} tokens.")
+        num_condition = layout.num_condition_video_rows
+        permutation = torch.cat(
+            [
+                layout.text_indices,
+                layout.video_indices[:num_condition],
+                layout.audio_indices,
+                layout.video_indices[num_condition:],
+            ]
+        )
+        return cls(permutation, num_text_rows, num_text_rows - num_text)
+
+    def rows(self, tensor: torch.Tensor, pad: str = "zeros") -> torch.Tensor:
+        """``tensor``'s leading axis in DiT order; padding rows are zeros or repeat the first row."""
+        tensor = tensor.index_select(0, self.permutation)
+        if not self.num_text_pad:
+            return tensor
+        if pad == "zeros":
+            filler = tensor.new_zeros((self.num_text_pad, *tensor.shape[1:]))
+        else:
+            filler = tensor[:1].expand(self.num_text_pad, *tensor.shape[1:])
+        return torch.cat([filler, tensor])
+
+    def runs(self, layout: MiniMaxH3PackedSequence) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+        """Decompose the DiT-ordered sequence into runs of constant ``(block, modality)``.
+
+        The AdaLN table is addressed by ``timestep_index * 3 + tag``, and both are piecewise
+        constant: the tag changes at a block edge or at a vision block inside the prompt, and
+        the timestep is uniform per block by construction (`build_row_timesteps`). So the graph
+        gathers one modulation row per run instead of one per sequence row.
+
+        Boundaries are structural — at every block edge and tag change — rather than found by
+        comparing AdaLN rows: the conditioning rows sit at ``max(t, 0.999)``, which equals the
+        video timestep on the first step only, so an equality-merged decomposition would change
+        its run count mid-schedule and retrace. The padding repeats the first prompt row, so it
+        extends that row's run.
+        """
+        num_condition_video = layout.num_condition_video_rows
+        num_condition_audio = layout.num_condition_audio_rows
+        block = torch.zeros(layout.sequence_length, dtype=torch.long)
+        block[layout.video_indices[:num_condition_video]] = 1
+        block[layout.audio_indices[:num_condition_audio]] = 2
+        block[layout.audio_indices[num_condition_audio:]] = 3
+        block[layout.video_indices[num_condition_video:]] = 4
+        tags = self.rows(layout.token_tags[:, None], pad="repeat")[:, 0]
+        keys = self.rows(block[:, None], pad="repeat")[:, 0] * 8 + tags.clamp(min=0)
+        changes = ((keys[1:] != keys[:-1]).nonzero().flatten() + 1).tolist()
+        edges = [0, *changes, int(keys.numel())]
+        runs = tuple(zip(edges[:-1], edges[1:]))
+        return runs, tuple(int(tags[start]) for start, _ in runs)

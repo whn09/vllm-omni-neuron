@@ -22,7 +22,7 @@ shapes and hates gathers:
    every block, though the table only ever holds a handful of distinct rows. The sequence is
    decomposed host-side into ``(start, end)`` runs over which the row is constant, the
    ``(num_runs, hidden_size)`` slice is gathered once, and each run is modulated by a broadcast.
-   See `packing.build_row_runs`.
+   See `packing.DiTRowOrder.runs`.
 
 3. **Only the rows that reach an output head run through the output stack.** Both heads are
    row-wise linear maps, so slicing first is identical to the reference's "project every row,
@@ -105,10 +105,16 @@ class MiniMaxH3Config:
 class MiniMaxH3RowRuns:
     """The static row geometry one compiled graph serves.
 
+    The DiT holds the packed sequence as ``[padding | text | conditions | audio | video]`` (see
+    `packing.DiTRowOrder`): the prompt is left-padded to its length bucket, so the rows that act
+    as keys are the one interval ``[padding, sequence_length)`` and the rows that even out the
+    CP shards trail it.
+
     Attributes:
-        num_text_rows: Length of the leading text block.
-        num_condition_rows: Length of the keyframe conditioning block.
-        num_audio_rows: Length of the audio block (both stereo channels).
+        num_text_rows: Length of the leading text block, i.e. the prompt bucket.
+        num_condition_rows: Length of the visual conditioning block (keyframes, references).
+        num_condition_audio_rows: Leading rows of the audio block that are reference soundtracks.
+        num_audio_rows: Length of the audio block (both stereo channels, references included).
         num_video_rows: Length of the target video block.
         runs: ``(start, end)`` spans of the full sequence over which the
             ``(timestep, modality)`` pair — and hence the AdaLN table row — is constant.
@@ -121,24 +127,30 @@ class MiniMaxH3RowRuns:
     num_video_rows: int
     runs: tuple[tuple[int, int], ...]
     num_timesteps: int
+    num_condition_audio_rows: int = 0
     media_runs: tuple[tuple[int, int], ...] = field(init=False)
 
     def __post_init__(self):
-        # The media suffix — everything the two output heads read — is
-        # `[conditions | audio | video]`, three spans each uniform in its timestep.
+        # The media suffix — everything the two output heads read — is `[conditions |
+        # reference audio | audio | video]`, four spans each uniform in its timestep.
         condition_end = self.num_condition_rows
+        reference_audio_end = condition_end + self.num_condition_audio_rows
         audio_end = condition_end + self.num_audio_rows
         video_end = audio_end + self.num_video_rows
-        self.media_runs = ((0, condition_end), (condition_end, audio_end), (audio_end, video_end))
+        self.media_runs = (
+            (0, condition_end),
+            (condition_end, reference_audio_end),
+            (reference_audio_end, audio_end),
+            (audio_end, video_end),
+        )
+
+    @property
+    def media_length(self) -> int:
+        return self.num_condition_rows + self.num_audio_rows + self.num_video_rows
 
     @property
     def sequence_length(self) -> int:
-        return (
-            self.num_text_rows
-            + self.num_condition_rows
-            + self.num_audio_rows
-            + self.num_video_rows
-        )
+        return self.media_length + self.num_text_rows
 
 
 # ===================================================================
@@ -261,6 +273,19 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
     return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1)
 
 
+#: Rows a row-wise op takes per call. The patch projections, `norm_out` and the output heads see
+#: every media row (before the CP split and after the gather); in one piece a ref2va-sized
+#: sequence (~52K media rows) overflows the on-chip state buffer at compile time (NCC_IBIR229).
+_ROW_CHUNK = 16384
+
+
+def _rowwise(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """``layer(x)`` for a row-wise ``layer``, over ``(B, rows, C)`` in chunks of `_ROW_CHUNK` rows."""
+    if x.shape[1] <= _ROW_CHUNK:
+        return layer(x)
+    return torch.cat([layer(piece) for piece in torch.split(x, _ROW_CHUNK, dim=1)], dim=1)
+
+
 def _modulate_runs(
     hidden_states: torch.Tensor,
     shift: torch.Tensor,
@@ -379,7 +404,7 @@ class MiniMaxH3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         rotary_emb=None,
-        cp_context: "_CPContext | None" = None,
+        context: "_AttentionContext | None" = None,
     ) -> torch.Tensor:
         qkv = torch.matmul(hidden_states, self.qkv_proj_weight)
         query, key, value = torch.tensor_split(qkv, self.qkv_split, dim=-1)
@@ -398,12 +423,14 @@ class MiniMaxH3Attention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        if cp_context is not None and self.sequence_is_sharded:
+        if context.cp_group is not None and self.sequence_is_sharded:
             attn_output = context_parallel_attention(
-                query, key, value, self.scale, cp_context.group, cp_context.num_pad
+                query, key, value, self.scale, context.cp_group, context.key_start, context.key_end
             )
         else:
-            attn_output = local_attention(query, key, value, self.scale)
+            attn_output = local_attention(
+                query, key, value, self.scale, context.key_start, context.key_end
+            )
 
         output = torch.matmul(attn_output.flatten(2), self.o_proj_weight)
         if self.tp_size > 1:
@@ -412,11 +439,18 @@ class MiniMaxH3Attention(nn.Module):
 
 
 @dataclass
-class _CPContext:
-    """What a sharded attention layer needs to know about the CP split. Built once per forward."""
+class _AttentionContext:
+    """What an attention layer needs beyond its inputs. Built once per forward.
 
-    group: object
-    num_pad: int
+    Attributes:
+        key_start: ``(1,)`` int32 first row that acts as a key (the end of the prompt padding).
+        key_end: One past the last row that acts as a key.
+        cp_group: The CP group when the rows are sharded over it, else None.
+    """
+
+    key_start: torch.Tensor
+    key_end: int
+    cp_group: object = None
 
 
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
@@ -498,8 +532,8 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         shift = shift.index_select(0, run_rows).to(hidden_states.dtype)
         scale = scale.index_select(0, run_rows).to(hidden_states.dtype)
         # The modulation stays at the block stack's precision; the caller casts to the
-        # output heads' dtype.
-        return _modulate_runs(self.norm(hidden_states), shift, scale, runs)
+        # output heads' dtype. The norm sees every media row, so it runs in row chunks.
+        return _modulate_runs(_rowwise(self.norm, hidden_states), shift, scale, runs)
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -528,8 +562,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
         self.ff = MiniMaxH3FeedForward(hidden_size, ffn_dim)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
+    def forward(self, hidden_states: torch.Tensor, context: _AttentionContext) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), context=context)
         hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
         return hidden_states
 
@@ -562,9 +596,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
         )
         self.final_norm = RMSNorm(hidden_size, eps=final_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, context: _AttentionContext) -> torch.Tensor:
         for block in self.refiner_blocks:
-            hidden_states = block(hidden_states)
+            hidden_states = block(hidden_states, context)
         return self.final_norm(hidden_states)
 
 
@@ -602,7 +636,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         runs: tuple[tuple[int, int], ...],
         run_rows: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        cp_context: _CPContext | None = None,
+        context: _AttentionContext,
     ) -> torch.Tensor:
         modulation = self.adaln_proj(temb)
         # One row per run instead of one per sequence row: the six table lookups shrink
@@ -615,7 +649,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         norm_hidden_states = _modulate_runs(
             self.norm1(hidden_states), shift_msa, scale_msa, runs
         )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, cp_context)
+        attn_output = self.attn(norm_hidden_states, rotary_emb, context)
         hidden_states = residual + _gate_runs(attn_output, gate_msa, runs)
 
         residual = hidden_states
@@ -772,6 +806,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         rotary_sin: torch.Tensor,
         adaln_run_rows: torch.Tensor,
         norm_out_run_rows: torch.Tensor,
+        num_text_tokens: torch.Tensor,
         row_runs: MiniMaxH3RowRuns,
         return_dict: bool = False,
     ):
@@ -783,12 +818,13 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 the order the packed layout places them in.
             audio_hidden_states: ``(B, num_audio_rows, audio_in_channels)`` audio rows,
                 channel-major.
-            encoder_hidden_states: ``(B, num_text_rows, text_dim)`` text conditioning.
+            encoder_hidden_states: ``(B, num_text_rows, text_dim)`` text conditioning: padding up
+                to the bucket, then the prompt.
             timestep: ``(num_timesteps,)`` distinct timestep values present in the
                 sequence, in ``[0, 1]`` and unscaled, padded to
                 ``row_runs.num_timesteps``.
             rotary_cos: ``(seq_len, 2 * 3 * rope_freq_dim)`` cosines of the packed
-                ``(t, h, w)`` grid, precomputed on the host in float32. MiniMax-H3
+                ``(t, h, w)`` grid in the DiT's row order, precomputed on the host in float32. MiniMax-H3
                 builds the grid in float64 because video and audio share one rotary
                 clock, and Neuron has no float64 — so the grid is built and reduced to
                 cos/sin off-device, where it costs one pass per request.
@@ -798,6 +834,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 sampled once per run.
             norm_out_run_rows: ``(3,)`` row of the per-timestep `norm_out` table each
                 media run reads.
+            num_text_tokens: ``(1,)`` int32 number of real prompt rows; the rest of the
+                ``num_text_rows`` bucket is the padding in front of them.
             row_runs: The static row geometry, baked into the trace.
             return_dict: Kept for signature parity with the reference; the Neuron
                 pipeline always consumes the tuple.
@@ -815,19 +853,32 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # `context_embedder` and the block stack are bfloat16), so every input is
         # aligned with its projection's parameter dtype, mirroring the reference's
         # explicit casts. The text stream sets the dtype of the packed sequence.
-        video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
-        audio_embeds = self.audio_proj_in(
-            audio_hidden_states.to(self.audio_proj_in.weight.dtype)
+        video_embeds = _rowwise(self.proj_in, hidden_states.to(self.proj_in.weight.dtype))
+        audio_embeds = _rowwise(
+            self.audio_proj_in, audio_hidden_states.to(self.audio_proj_in.weight.dtype)
         )
         text_embeds = self.context_embedder(
             encoder_hidden_states.to(self.context_embedder.weight.dtype)
         )
-        text_embeds = self.token_refiner(text_embeds)
+        num_text_rows = row_runs.num_text_rows
+        key_start = num_text_rows - num_text_tokens.to(torch.int32)
+        # The refiner attends over the prompt alone, whose bucket need not be a multiple of the
+        # 128-query tile the attention kernel reads its bounds in; the materialized fallback
+        # does not fit on-chip at reference-sized prompts (NCC_IBIR229). So it runs over a copy
+        # left-padded to the tile, the extra rows masked like the bucket's own padding.
+        refiner_pad = -num_text_rows % 128
+        if refiner_pad:
+            text_embeds = torch.cat([text_embeds.new_zeros((text_embeds.shape[0], refiner_pad, text_embeds.shape[2])), text_embeds], dim=1)
+        text_embeds = self.token_refiner(
+            text_embeds,
+            _AttentionContext(key_start=key_start + refiner_pad, key_end=num_text_rows + refiner_pad),
+        )
+        if refiner_pad:
+            text_embeds = text_embeds[:, refiner_pad:]
 
-        # `[text | keyframe conditions | target audio | target video]`. The reference
-        # scatters with three `index_copy` calls into a zero buffer; the row blocks are
-        # contiguous and statically sized, so a `cat` produces the same sequence without
-        # a scatter.
+        # `[padding | text | conditions | audio | video]` (see `MiniMaxH3RowRuns`). The
+        # reference scatters with three `index_copy` calls into a zero buffer; the row blocks
+        # are contiguous and statically sized, so a `cat` builds the sequence instead.
         dtype = text_embeds.dtype
         hidden_states = torch.cat(
             [
@@ -838,6 +889,7 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             ],
             dim=1,
         )
+        context = _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
 
         # 2. One timestep embedding per distinct noise level. `temb` is shared by all
         # AdaLN projections, which are bfloat16 while `time_embedder` is float32, so it
@@ -849,7 +901,6 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         # except attention is row-local, so the shard needs no communication until the ring.
         runs = row_runs.runs
         sequence_length = row_runs.sequence_length
-        cp_context = None
         if self.cp_size > 1:
             shard = parallel.sequence_shard(sequence_length, self.cp_size, self.cp_rank)
             if shard.num_pad:
@@ -868,21 +919,20 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 min(shard.end, sequence_length),
                 pad_to=shard.shard_length,
             )
-            cp_context = _CPContext(group=self.cp_group, num_pad=shard.num_pad)
+            context = _AttentionContext(key_start, row_runs.sequence_length, cp_group=self.cp_group)
 
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, rotary_emb, cp_context)
+            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, rotary_emb, context)
 
-        if cp_context is not None:
+        if context.cp_group is not None:
             # Back to full length before the output heads, so `norm_out`'s run spans stay in
             # absolute coordinates.
-            hidden_states = cp_context.group.all_gather(hidden_states.contiguous(), dim=1)
-            hidden_states = hidden_states[:, :sequence_length]
+            hidden_states = self.cp_group.all_gather(hidden_states.contiguous(), dim=1)
 
         # 3. Only the media rows reach a head, and both heads are row-wise linear maps,
         # so slicing before the output stack is identical to the reference's "project
         # every row, then `index_select`" — and drops the text rows from `norm_out` too.
-        media = hidden_states[:, row_runs.num_text_rows :]
+        media = hidden_states[:, num_text_rows : row_runs.sequence_length]
         media = self.norm_out(media, temb, row_runs.media_runs, norm_out_run_rows)
 
         condition_end = num_condition_rows
@@ -890,8 +940,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         video_rows = torch.cat([media[:, :condition_end], media[:, audio_end:]], dim=1)
         audio_rows = media[:, condition_end:audio_end]
 
-        video_output = self.proj_out(video_rows.to(self.proj_out.weight.dtype))
-        audio_output = self.audio_proj_out(audio_rows.to(self.audio_proj_out.weight.dtype))
+        video_output = _rowwise(self.proj_out, video_rows.to(self.proj_out.weight.dtype))
+        audio_output = _rowwise(self.audio_proj_out, audio_rows.to(self.audio_proj_out.weight.dtype))
         return video_output, audio_output
 
     # ---------------------------------------------------------------

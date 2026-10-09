@@ -15,6 +15,7 @@ decoder layers are built: 51 rather than 50 because the last hidden state of a s
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -32,6 +33,27 @@ TEXT_ENCODER_LAYER = 50
 _ENCODE_THREADS_ENV = "MINIMAX_H3_TEXT_ENCODER_THREADS"
 
 
+@contextlib.contextmanager
+def host_threads():
+    """Lift the Lite worker's one-thread pin while rank 0 runs host-side models."""
+    threads = int(os.environ.get(_ENCODE_THREADS_ENV, "0")) or max(1, (os.cpu_count() or 2) // 2)
+    previous = torch.get_num_threads()
+    torch.set_num_threads(threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def broadcast_from_owner(value):
+    """Rank 0's picklable ``value`` on every rank, over the world's CPU group."""
+    if not dist.is_initialized() or _world().world_size == 1:
+        return value
+    holder = [value]
+    dist.broadcast_object_list(holder, src=_world().ranks[0], group=_world().cpu_group)
+    return holder[0]
+
+
 def _world():
     from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 
@@ -46,6 +68,8 @@ class MiniMaxH3TextEncoder:
         self.dtype = dtype
         self.model = None
         self.hidden_size = None
+        self.image_token_id = None
+        self.video_token_id = None
 
     @property
     def _is_owner(self) -> bool:
@@ -56,6 +80,8 @@ class MiniMaxH3TextEncoder:
 
         config = AutoConfig.from_pretrained(self.path)
         self.hidden_size = config.text_config.hidden_size
+        self.image_token_id = config.image_token_id
+        self.video_token_id = config.video_token_id
         if not self._is_owner:
             return
 
@@ -69,28 +95,35 @@ class MiniMaxH3TextEncoder:
         logger.info("MiniMax-H3 conditioner loaded on the host in %.1f s", time.perf_counter() - started)
 
     @torch.no_grad()
-    def _forward(self, token_ids: list[int]) -> torch.Tensor:
-        threads = int(os.environ.get(_ENCODE_THREADS_ENV, "0")) or max(1, (os.cpu_count() or 2) // 2)
-        previous = torch.get_num_threads()
-        torch.set_num_threads(threads)
-        try:
+    def _forward(self, token_ids: list[int], vision_inputs: dict | None = None) -> torch.Tensor:
+        with host_threads():
             input_ids = torch.tensor([token_ids], dtype=torch.long)
+            vision_inputs = dict(vision_inputs or {})
+            # Qwen-internal modality ids (`0` text, `1` image, `2` video), which drive its
+            # per-modality rotary layout; not MiniMax-H3's own row tags.
+            mm_token_type_ids = (input_ids == self.image_token_id).long()
+            mm_token_type_ids[input_ids == self.video_token_id] = 2
+            for name in ("pixel_values", "pixel_values_videos"):
+                if name in vision_inputs:
+                    vision_inputs[name] = vision_inputs[name].to(self.dtype)
             outputs = self.model.model(
                 input_ids=input_ids,
                 attention_mask=torch.ones_like(input_ids),
-                # Qwen-internal modality ids; a t2va presentation is all text.
-                mm_token_type_ids=torch.zeros_like(input_ids),
+                mm_token_type_ids=mm_token_type_ids,
                 use_cache=False,
                 output_hidden_states=True,
+                **vision_inputs,
             )
             return outputs.hidden_states[TEXT_ENCODER_LAYER].to(self.dtype).contiguous()
-        finally:
-            torch.set_num_threads(previous)
 
-    def encode(self, token_ids: list[int]) -> torch.Tensor:
-        """``(1, len(token_ids), hidden_size)`` conditioning on the host, identical on every rank."""
+    def encode(self, token_ids: list[int], vision_inputs: dict | None = None) -> torch.Tensor:
+        """``(1, len(token_ids), hidden_size)`` conditioning on the host, identical on every rank.
+
+        ``vision_inputs`` are the conditioner's own image inputs (``pixel_values``,
+        ``image_grid_thw``) for the vision blocks ``token_ids`` contains.
+        """
         if self._is_owner:
-            embeds = self._forward(token_ids)
+            embeds = self._forward(token_ids, vision_inputs)
         else:
             embeds = torch.empty((1, len(token_ids), self.hidden_size), dtype=self.dtype)
         if dist.is_initialized() and _world().world_size > 1:

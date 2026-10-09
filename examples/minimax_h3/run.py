@@ -5,6 +5,8 @@ Usage:
     python examples/minimax_h3/run.py --model-path /path/to/MiniMax-H3            # 64 cores
     python examples/minimax_h3/run.py --model-path ... --dev                      # quick smoke
     python examples/minimax_h3/run.py --model-path ... --tensor-parallel-size 8 --ring-degree 4
+    python examples/minimax_h3/run.py --model-path ... --image first.png [--last-image last.png]  # fl2va
+    python examples/minimax_h3/run.py --model-path ... --reference image:a.png --reference video:b.mp4  # ref2va
 """
 
 import argparse
@@ -17,6 +19,7 @@ import wave
 
 import vllm_omni_neuron.bootstrap  # noqa: F401  isort: skip  must precede vllm imports
 import yaml
+from PIL import Image
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -36,14 +39,26 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--stage-config", type=str, default=None)
 parser.add_argument("--output", type=str, default="minimax_h3.mp4")
 parser.add_argument("--first-device", type=int, default=0, help="First NeuronCore of the stage.")
+parser.add_argument("--image", type=str, default=None, help="fl2va: keyframe the video starts from.")
+parser.add_argument("--last-image", type=str, default=None, help="fl2va: keyframe the video ends on.")
+parser.add_argument(
+    "--reference",
+    type=str,
+    action="append",
+    default=None,
+    help="ref2va, in the order the model reads them: image:PATH, video:PATH (with its soundtrack) or audio:PATH.",
+)
 parser.add_argument("--repeat", type=int, default=1, help="Send the request N times, timing each.")
 parser.add_argument(
     "--prompt",
     type=str,
-    default=(
-        "A street busker plays a bright melody on a violin under warm evening light, "
-        "passers-by slowing to listen, shallow depth of field, cinematic"
-    ),
+    action="append",
+    default=None,
+    help="May be repeated: the prompts are sent in order, each --repeat times, in one process.",
+)
+DEFAULT_PROMPT = (
+    "A street busker plays a bright melody on a violin under warm evening light, "
+    "passers-by slowing to listen, shallow depth of field, cinematic"
 )
 args = parser.parse_args()
 
@@ -113,8 +128,25 @@ def write_outputs(video, audio, sampling_rate: int, path: str) -> None:
           f"{samples.shape[0] / sampling_rate:.2f} s of audio to {path}")
 
 
+def load_references(specs):
+    """``kind:path`` specs -> the request's ``references`` list, in order.
+
+    Paths, not decoded media: the request is copied to every worker, and each rank decodes the
+    files itself (see `references`).
+    """
+    references = []
+    for spec in specs:
+        kind, _, path = spec.partition(":")
+        if kind not in ("image", "video", "audio") or not path:
+            raise SystemExit(f"--reference must be image:PATH, video:PATH or audio:PATH, got {spec!r}.")
+        references.append({"type": kind, "path": os.path.abspath(path)})
+    return references
+
+
 def main():
     model_config = {}
+    if args.reference:
+        model_config["task"] = "ref2va"
     if args.num_layers is not None or args.dev:
         model_config["num_layers"] = args.num_layers or 2
 
@@ -132,11 +164,21 @@ def main():
         model_config=model_config,
     )
 
-    # The released recipe: 1344x768, 124 frames (5.17 s at 24 fps), 50 steps.
+    # The released recipe: 1344x768, 124 frames (5.17 s at 24 fps), 50 steps. With a keyframe
+    # the canvas follows its aspect ratio unless --height/--width are given.
+    multi_modal_data = {}
+    if args.image:
+        multi_modal_data["image"] = Image.open(args.image).convert("RGB")
+    if args.last_image:
+        multi_modal_data["last_image"] = Image.open(args.last_image).convert("RGB")
+    if args.reference:
+        multi_modal_data["references"] = load_references(args.reference)
     if args.dev:
         height, width, num_frames, steps = 384, 704, 124, 3
     else:
-        height, width, num_frames, steps = 768, 1344, 124, 50
+        # With a keyframe the canvas follows its aspect ratio; ref2va defaults to 16:9.
+        keyframed = "image" in multi_modal_data or "last_image" in multi_modal_data
+        height, width, num_frames, steps = (None, None, 124, 50) if keyframed else (768, 1344, 124, 50)
     params = OmniDiffusionSamplingParams(
         height=args.height or height,
         width=args.width or width,
@@ -145,10 +187,16 @@ def main():
         seed=args.seed,
     )
 
-    for index in range(args.repeat):
-        started = time.perf_counter()
-        result = omni.generate({"prompt": args.prompt}, params)
-        print(f"[request {index + 1}/{args.repeat}] {time.perf_counter() - started:.2f} s")
+    prompts = args.prompt or [DEFAULT_PROMPT]
+    for prompt_index, prompt in enumerate(prompts):
+        for index in range(args.repeat):
+            started = time.perf_counter()
+            inputs = {"prompt": prompt}
+            if multi_modal_data:
+                inputs["multi_modal_data"] = multi_modal_data
+            result = omni.generate(inputs, params)
+            print(f"[prompt {prompt_index + 1}/{len(prompts)} request {index + 1}/{args.repeat}] "
+                  f"{time.perf_counter() - started:.2f} s")
 
     output = result[0].request_output
     audio = (output.multimodal_output or {}).get("audio")

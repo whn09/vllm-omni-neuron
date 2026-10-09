@@ -68,6 +68,15 @@ from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_kl_minimax_
 from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_minimax_h3_audio import (
     NeuronAutoencoderKLMiniMaxH3Audio,
 )
+from vllm_omni_neuron.diffusion.models.minimax_h3.audio_encoder import MiniMaxH3AudioEncoder
+from vllm_omni_neuron.diffusion.models.minimax_h3.keyframes import (
+    collect_keyframes,
+    fit_keyframes,
+    keyframe_pixels,
+    keyframe_presentation,
+    resolve_keyframe_canvas,
+    sample_condition_latents,
+)
 from vllm_omni_neuron.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3RowRuns,
     NeuronMiniMaxH3Transformer3DModel,
@@ -78,22 +87,34 @@ from vllm_omni_neuron.diffusion.models.minimax_h3.packing import (
     MINIMAX_H3_PIXEL_MEAN,
     MINIMAX_H3_PIXEL_STD,
     MINIMAX_H3_TEXT_TAG,
+    DiTRowOrder,
     align_num_frames,
     audio_latent_num_frames,
     build_packed_sequence,
+    build_ref2va_packed_sequence,
     build_rotary_tables,
-    build_row_runs,
     build_row_timesteps,
     build_run_table_rows,
     pad_num_timesteps,
     patchify_video_latents,
     resolve_canvas_size,
+    text_bucket_length,
     unpack_audio_tokens,
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from vllm_omni_neuron.diffusion.models.minimax_h3.references import (
+    normalize_references,
+    parse_references,
+    reference_pixels,
+    reference_presentation,
+)
 from vllm_omni_neuron.diffusion.models.minimax_h3.scheduler import NeuronMiniMaxH3Scheduler
-from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
+from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder import (
+    MiniMaxH3TextEncoder,
+    broadcast_from_owner,
+    host_threads,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +198,11 @@ def _component_config(model_path: str, subfolder: str, filename: str) -> dict:
 
 
 class MiniMaxH3Pipeline(nn.Module):
-    """MiniMax-H3 ``t2va`` for Neuron.
+    """MiniMax-H3 for Neuron: ``t2va``, ``fl2va`` and ``ref2va``.
 
-    ``fl2va`` and ``ref2va`` are deliberately out of scope for now: they need the
-    conditioner's vision tower, the video VAE's encode path and — for ``ref2va`` — the
-    checkpoint's second transformer partition, none of which affect the ``t2va`` graphs.
-    The packing module already carries the keyframe geometry, so the layout code below is
-    written against `keyframe_anchors` rather than assuming it is empty.
+    A request with ``multi_modal_data["image"]`` / ``["last_image"]`` is ``fl2va``; one with
+    ``["references"]`` is ``ref2va``, which needs a stage with ``model_config.task: ref2va``
+    because it runs the checkpoint's second transformer partition (``transformer_ref/``).
 
     Args:
         od_config: The stage's `OmniDiffusionConfig`.
@@ -211,7 +230,13 @@ class MiniMaxH3Pipeline(nn.Module):
 
         # The converted repository is modular-only: there is no `model_index.json`, so
         # every component is read from its own subfolder.
-        transformer_config = _component_config(model, "transformer", "config.json")
+        # `model_config.task`: `t2va` (which also serves `fl2va`) or `ref2va`. The two are
+        # separate transformer partitions of the checkpoint, and a stage holds one of them.
+        self.task = (od_config.model_config or {}).get("task", "t2va")
+        if self.task not in ("t2va", "ref2va"):
+            raise ValueError(f"`model_config.task` must be 't2va' or 'ref2va', got {self.task!r}.")
+        self._transformer_subfolder = "transformer_ref" if self.task == "ref2va" else "transformer"
+        transformer_config = _component_config(model, self._transformer_subfolder, "config.json")
         vae_config = _component_config(model, "vae", "config.json")
         audio_vae_config = _component_config(model, "audio_vae", "config.json")
 
@@ -226,21 +251,37 @@ class MiniMaxH3Pipeline(nn.Module):
         self.transformer_config = self.transformer.config
 
         # The video decoder is replicated on every rank, which decodes its own share of the
-        # tiles; t2va never encodes, so the encoder half is not built. The audio decoder runs on
-        # the host. `MINIMAX_H3_DECODE=0` skips both and returns no frames (for DiT-only runs).
+        # tiles. The audio decoder runs on the host. `MINIMAX_H3_DECODE=0` skips both decoders
+        # and returns no frames (for DiT-only runs); the keyframe encoder is still built.
+        self._decode = os.environ.get("MINIMAX_H3_DECODE", "1") != "0"
+        # The encoder (110M parameters, kept float32) encodes `fl2va` keyframes.
+        with_encoder = self.task == "ref2va" or bool(
+            (od_config.model_config or {}).get("enable_keyframes", True)
+        )
         self.vae = None
         self.audio_vae = None
-        if os.environ.get("MINIMAX_H3_DECODE", "1") != "0":
+        if self._decode or with_encoder:
             self.vae = NeuronAutoencoderKLMiniMaxH3(
-                compute_dtype=torch.float16, with_encoder=False, **vae_config
+                compute_dtype=torch.float16, with_encoder=with_encoder, **vae_config
             )
+        if self._decode:
             self.audio_vae = NeuronAutoencoderKLMiniMaxH3Audio(**audio_vae_config)
+        # `ref2va` soundtracks are encoded on the host by rank 0 (see `audio_encoder`).
+        self.audio_encoder = MiniMaxH3AudioEncoder(audio_vae_config) if self.task == "ref2va" else None
         # The audio decoder is 65M parameters run once per request: ~2 s on the host for a
         # 5 s clip, exactly. On Neuron it decodes no faster, and its alias-free resamplers
         # make every rank compile seven large graphs on a cold start (tens of GB of host
         # memory each), so it stays on the host unless `model_config.audio_vae_device` is
         # `neuron`.
         self._audio_on_neuron = (od_config.model_config or {}).get("audio_vae_device", "cpu") == "neuron"
+        # Prompt-length buckets: the DiT graph is built for the smallest padded prompt length that
+        # makes the packed sequence a multiple of this, so one graph serves every prompt up to
+        # it. `1` builds a graph per exact prompt length (`MINIMAX_H3_TEXT_BUCKET_ALIGN` overrides).
+        self._text_bucket_align = int(
+            os.environ.get(
+                "MINIMAX_H3_TEXT_BUCKET_ALIGN", (od_config.model_config or {}).get("text_bucket_align", 512)
+            )
+        )
 
         # Two schedules per request. `od_config.flow_shift` overrides the video one; the
         # audio shift has no od_config field and comes from its own scheduler config.
@@ -272,6 +313,7 @@ class MiniMaxH3Pipeline(nn.Module):
 
         self._transformer_compile_kwargs: dict | None = None
         self._compiled_transformer = None
+        self._qwen_processor = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -297,7 +339,9 @@ class MiniMaxH3Pipeline(nn.Module):
         del weights
         model = self.model_path
         self.text_encoder.load_weights()
-        self.transformer.load_weights(os.path.join(model, "transformer"))
+        self.transformer.load_weights(os.path.join(model, self._transformer_subfolder))
+        if self.audio_encoder is not None and self.text_encoder._is_owner:
+            self.audio_encoder.load_weights(os.path.join(model, "audio_vae"))
         if self.vae is not None:
             self.vae.load_weights(os.path.join(model, "vae"))
         if self.audio_vae is not None:
@@ -326,7 +370,7 @@ class MiniMaxH3Pipeline(nn.Module):
             "--internal-max-instruction-limit=15000000",
         ]
         self.vae.compile(*args, **vae_kwargs)
-        if self._audio_on_neuron:
+        if self._audio_on_neuron and self.audio_vae is not None:
             self.audio_vae.compile(*args, **copy.deepcopy(kwargs))
 
     def compile_transformer(self, *args, **kwargs):
@@ -429,27 +473,104 @@ class MiniMaxH3Pipeline(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def encode_prompt(self, prompt: str, dtype: torch.dtype | None = None):
-        """Encode MiniMax-H3's ``t2va`` presentation of a request.
+    def encode_prompt(self, prompt: str, dtype: torch.dtype | None = None, keyframes=()):
+        """Encode MiniMax-H3's presentation of a request.
 
-        The prompt goes in verbatim: no chat template, no special tokens. The
-        conditioning is ``hidden_states[50]`` of the Qwen3-VL tower, i.e. the output of
-        its first 50 decoder layers *before* the final norm.
-
-        The embeddings come back in the stage's `dtype` and the DiT's `context_embedder`
-        casts them to whatever it holds — so this does not read the DiT's precision, which
-        is a property of its *block stack* and not of the conditioning.
+        ``t2va``: the prompt verbatim, no chat template, no special tokens. ``fl2va``: a
+        ``"<Picture i>: "`` label and a vision block per keyframe first, the vision rows tagged
+        as video. The conditioning is ``hidden_states[50]`` of the Qwen3-VL tower, i.e. the
+        output of its first 50 decoder layers *before* the final norm.
 
         Returns:
-            ``((1, num_text_tokens, text_dim)`` embeddings, ``(num_text_tokens,)`` tags``)``.
+            ``((1, num_text_tokens, text_dim)`` embeddings on the host, ``(num_text_tokens,)``
+            row tags``)``.
         """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("MiniMax-H3 conditions on a non-empty prompt string.")
 
-        token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        prompt_embeds = self.text_encoder.encode(token_ids).to(device=self.device, dtype=dtype or self._dtype)
-        token_tags = torch.full((len(token_ids),), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        vision_inputs = None
+        if keyframes:
+            token_ids, token_tags, vision_inputs = keyframe_presentation(
+                self.tokenizer, self._processor().image_processor, keyframes, prompt
+            )
+        else:
+            token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            token_tags = torch.full((len(token_ids),), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        # Kept on the host: `denoise` pads it to the prompt bucket before it crosses over.
+        prompt_embeds = self.text_encoder.encode(token_ids, vision_inputs).to(dtype=dtype or self._dtype)
         return prompt_embeds, token_tags
+
+    def _processor(self):
+        """The conditioner's image and video processor, loaded on first use."""
+        if self._qwen_processor is None:
+            from transformers import AutoProcessor
+
+            self._qwen_processor = AutoProcessor.from_pretrained(
+                self.model_path, subfolder="processor", local_files_only=True
+            )
+        return self._qwen_processor
+
+    def _condition_latents(self, pixels: torch.Tensor, chunked: bool = False) -> torch.Tensor:
+        """One visual condition through the video VAE, its posterior sampled as released.
+
+        A single frame (a keyframe, an image reference) goes through the spatial encoder alone;
+        a video reference through the temporal chunking.
+        """
+        moments = self.vae.encode(pixels) if chunked else self.vae.encode_clip(pixels)
+        return sample_condition_latents(moments, self.vae.config.latents_mean, self.vae.config.latents_std)
+
+    def noise_condition_rows(self, condition_latents, generator) -> torch.Tensor:
+        """Noise the visual conditions to ``t = 0.999`` and pack them: the leading video rows.
+
+        One draw per condition from the request's generator, in packed order and before the
+        generated rows' noise — the draw order is part of what the generator reproduces. The
+        conditions are held at that level for every step.
+        """
+        rows = []
+        for condition in condition_latents:
+            noise = torch.randn(condition.shape, generator=generator, dtype=torch.float32)
+            noised = self.scheduler.scale_noise(condition, MINIMAX_H3_KEYFRAME_NOISE_AUG, noise)
+            rows.append(patchify_video_latents(noised, self.patch_size))
+        return torch.cat(rows)
+
+    @torch.no_grad()
+    def prepare_references(self, prompt: str, references, num_frames: int, geometry):
+        """``ref2va``: normalize, present and encode the references, and build the layout.
+
+        Returns ``(prompt_embeds, layout, condition_latents, audio_condition_rows)``; the
+        soundtrack rows are clean (``t = 1.0``) and already normalized.
+        """
+        num_latent_frames, latent_height, latent_width, num_audio_latents = geometry
+        normalized = normalize_references(parse_references(references), num_frames, self.audio_sampling_rate)
+        token_ids, token_tags, vision_inputs = reference_presentation(
+            self.tokenizer, self._processor(), normalized, prompt
+        )
+        prompt_embeds = self.text_encoder.encode(token_ids, vision_inputs).to(dtype=self._dtype)
+
+        condition_latents = [
+            self._condition_latents(reference_pixels(reference), chunked=reference.kind == "video")
+            for reference in normalized
+            if reference.kind in ("image", "video")
+        ]
+        # Rank 0 encodes the soundtracks on the host and every rank receives the rows.
+        audio_rows = None
+        if self.text_encoder._is_owner:
+            with host_threads():
+                audio_rows = [self.audio_encoder.encode(r.audio) for r in normalized if r.has_audio]
+        audio_rows = broadcast_from_owner(audio_rows)
+
+        layout = build_ref2va_packed_sequence(
+            text_token_tags=token_tags,
+            reference_kinds=[(reference.kind, reference.has_audio) for reference in normalized],
+            condition_shapes=[tuple(latents.shape[2:5]) for latents in condition_latents],
+            audio_condition_rows=[rows.shape[0] for rows in audio_rows],
+            num_latent_frames=num_latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            num_audio_latents=num_audio_latents,
+            patch_size=self.patch_size,
+        )
+        return prompt_embeds, layout, condition_latents, (torch.cat(audio_rows) if audio_rows else None)
 
     # ------------------------------------------------------------------
     # Latents
@@ -528,20 +649,18 @@ class MiniMaxH3Pipeline(nn.Module):
 
     @staticmethod
     def _norm_out_run_rows(row_runs, timestep_indices: torch.Tensor) -> torch.Tensor:
-        """The per-timestep `norm_out` table row of each of the three media runs.
+        """The per-timestep `norm_out` table row of each of the four media runs.
 
-        `norm_out` is addressed per timestep rather than per ``(timestep, modality)``, and
-        its runs are offsets into the media suffix, so they are shifted by the text
-        length. An empty run — no keyframe, in ``t2va`` — reads row 0, which nothing
-        indexes.
+        `norm_out` is addressed per timestep rather than per ``(timestep, modality)``; its runs
+        are offsets into the media suffix of the DiT-ordered ``timestep_indices``. An empty
+        run — no condition, in ``t2va`` — reads row 0, which nothing indexes.
         """
-        media_start = row_runs.num_text_rows
         rows = []
         for start, end in row_runs.media_runs:
             if end == start:
                 rows.append(0)
                 continue
-            block = timestep_indices[media_start + start : media_start + end]
+            block = timestep_indices[row_runs.num_text_rows + start : row_runs.num_text_rows + end]
             first = int(block[0].item())
             if int(block.min().item()) != int(block.max().item()):
                 raise ValueError(
@@ -586,31 +705,41 @@ class MiniMaxH3Pipeline(nn.Module):
             )
 
         plan, num_timesteps = self._row_timestep_plan(layout, timesteps, audio_timesteps)
-        runs, run_tags = build_row_runs(layout, num_timesteps)
 
+        # The DiT runs the sequence as `[padding | text | conditions | audio | video]`, the prompt
+        # left-padded to its length bucket (see `DiTRowOrder`). Everything that is per row is
+        # built in the released order with the real prompt length, then reordered.
+        num_text = int(layout.text_indices.shape[0])
         num_condition_video_rows = layout.num_condition_video_rows
         num_condition_audio_rows = layout.num_condition_audio_rows
+        media_length = layout.sequence_length - num_text
+        order = DiTRowOrder.build(
+            layout, text_bucket_length(num_text, media_length, self._text_bucket_align)
+        )
+        runs, run_tags = order.runs(layout)
         row_runs = MiniMaxH3RowRuns(
-            num_text_rows=int(layout.text_indices.shape[0]),
+            num_text_rows=order.num_text_rows,
             num_condition_rows=num_condition_video_rows,
+            num_condition_audio_rows=num_condition_audio_rows,
             num_audio_rows=int(layout.audio_indices.shape[0]),
             num_video_rows=int(layout.video_indices.shape[0]) - num_condition_video_rows,
             runs=runs,
             num_timesteps=num_timesteps,
         )
-        if row_runs.sequence_length != layout.sequence_length:
-            raise AssertionError(
-                f"The row geometry covers {row_runs.sequence_length} rows but the packed "
-                f"layout has {layout.sequence_length}."
-            )
 
         rotary_cos, rotary_sin = build_rotary_tables(
             layout.position_ids,
             self.transformer_config.rope_freq_dim,
             self.transformer_config.rope_theta,
         )
-        rotary_cos = rotary_cos.to(self.device)
-        rotary_sin = rotary_sin.to(self.device)
+        rotary_cos = order.rows(rotary_cos).to(self.device)
+        rotary_sin = order.rows(rotary_sin).to(self.device)
+        prompt_embeds = prompt_embeds.to("cpu")
+        prompt_embeds = torch.cat(
+            [prompt_embeds.new_zeros((1, order.num_text_pad, prompt_embeds.shape[-1])), prompt_embeds],
+            dim=1,
+        ).to(self.device)
+        num_text_tokens = torch.tensor([num_text], dtype=torch.int32).to(self.device)
 
         transformer = self._transformer_module()
         # This line is where every stage-level timing analysis finds the denoise window, so it
@@ -619,10 +748,11 @@ class MiniMaxH3Pipeline(nn.Module):
         if trace_steps is not None:
             num_steps = min(num_steps, trace_steps)
         logger.info(
-            "MiniMax-H3 denoise: %d steps over %d rows (%d text, %d condition, %d audio, "
-            "%d video), %d timestep rows, %d runs.",
+            "MiniMax-H3 denoise: %d steps over %d rows (%d text in a %d-row bucket, %d condition, "
+            "%d audio, %d video), %d timestep rows, %d runs.",
             num_steps,
-            layout.sequence_length,
+            row_runs.sequence_length,
+            num_text,
             row_runs.num_text_rows,
             row_runs.num_condition_rows,
             row_runs.num_audio_rows,
@@ -637,6 +767,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 break
             step_started = time.perf_counter()
             step_timesteps, timestep_indices = plan[index]
+            timestep_indices = order.rows(timestep_indices, pad="repeat")
             adaln_run_rows, _ = build_run_table_rows(runs, run_tags, timestep_indices)
             norm_out_run_rows = self._norm_out_run_rows(row_runs, timestep_indices)
 
@@ -649,6 +780,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 rotary_sin=rotary_sin,
                 adaln_run_rows=adaln_run_rows.to(self.device),
                 norm_out_run_rows=norm_out_run_rows.to(self.device),
+                num_text_tokens=num_text_tokens,
                 row_runs=row_runs,
             )
             noise_pred = noise_pred[0].detach().to(device="cpu", dtype=torch.float32)
@@ -892,7 +1024,7 @@ class MiniMaxH3Pipeline(nn.Module):
         # reaches the graph as activations — but the count is part of the graph's shape.
         # Repeating one token id keeps this independent of the tokenizer's vocabulary.
         token_ids = [getattr(self.tokenizer, "eos_token_id", None) or 0] * prompt_tokens
-        prompt_embeds = self.text_encoder.encode(token_ids).to(device=self.device, dtype=self._dtype)
+        prompt_embeds = self.text_encoder.encode(token_ids).to(dtype=self._dtype)
         token_tags = torch.full((prompt_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
 
         layout = build_packed_sequence(
@@ -930,7 +1062,7 @@ class MiniMaxH3Pipeline(nn.Module):
             trace_steps=2,
         )
 
-        if self.vae is None:
+        if not self._decode:
             return
         # The decoders trace too, and the video decoder's graph is the larger of the two.
         self.decode_video(
@@ -979,10 +1111,26 @@ class MiniMaxH3Pipeline(nn.Module):
 
         params = req.sampling_params
         first = req.prompts[0] if req.prompts else None
+        multi_modal_data = {}
         if isinstance(first, str):
             prompt = first
-        elif isinstance(first, dict) and first.get("prompt"):
-            prompt = first["prompt"]
+        elif isinstance(first, dict):
+            prompt = first.get("prompt") or prompt
+            multi_modal_data = first.get("multi_modal_data") or {}
+        # `fl2va`: a first and/or last keyframe. They fix the canvas (the first keyframe's
+        # aspect ratio unless `height`/`width` are given) and are put onto it here.
+        keyframes, keyframe_anchors = collect_keyframes(
+            multi_modal_data.get("image"), multi_modal_data.get("last_image")
+        )
+        # `ref2va`: image / video / audio references, on the stage that holds `transformer_ref`.
+        references = multi_modal_data.get("references")
+        if bool(references) != (self.task == "ref2va"):
+            raise ValueError(
+                "`multi_modal_data['references']` needs a `model_config.task: ref2va` stage, and a "
+                f"`ref2va` stage needs references; this stage serves {self.task!r}."
+            )
+        if references and keyframes:
+            raise ValueError("A request carries either keyframes (`fl2va`) or references (`ref2va`), not both.")
 
         height = params.height or height
         width = params.width or width
@@ -1006,6 +1154,9 @@ class MiniMaxH3Pipeline(nn.Module):
             params.audio_latents if params.audio_latents is not None else audio_latents
         )
 
+        if keyframes:
+            height, width = resolve_keyframe_canvas(keyframes, height, width)
+            keyframes = fit_keyframes(keyframes, height, width)
         num_frames = self.check_inputs(height, width, num_frames)
         if height is None:
             # No keyframe to take an aspect ratio from, so MiniMax-H3's own 16:9 canvas.
@@ -1024,18 +1175,33 @@ class MiniMaxH3Pipeline(nn.Module):
             )
             self.vae.use_tiling = True
 
-        with _stage("encode_prompt"):
-            prompt_embeds, token_tags = self.encode_prompt(prompt)
-
-        with _stage("pack_layout"):
-            layout = build_packed_sequence(
-                text_token_tags=token_tags,
-                num_latent_frames=num_latent_frames,
-                latent_height=latent_height,
-                latent_width=latent_width,
-                num_audio_latents=num_audio_latents,
-                patch_size=self.patch_size,
-            )
+        geometry = (num_latent_frames, latent_height, latent_width, num_audio_latents)
+        condition_latents, audio_condition_rows = [], None
+        if references:
+            with _stage("encode_references"):
+                prompt_embeds, layout, condition_latents, audio_condition_rows = self.prepare_references(
+                    prompt, references, num_frames, geometry
+                )
+        else:
+            with _stage("encode_prompt"):
+                prompt_embeds, token_tags = self.encode_prompt(prompt, keyframes=keyframes)
+            with _stage("pack_layout"):
+                layout = build_packed_sequence(
+                    text_token_tags=token_tags,
+                    num_latent_frames=num_latent_frames,
+                    latent_height=latent_height,
+                    latent_width=latent_width,
+                    num_audio_latents=num_audio_latents,
+                    patch_size=self.patch_size,
+                    keyframe_anchors=keyframe_anchors,
+                )
+            if keyframes:
+                with _stage("encode_keyframes"):
+                    condition_latents = [
+                        self._condition_latents(keyframe_pixels(keyframe)) for keyframe in keyframes
+                    ]
+        # The conditioning noise is drawn before the generated rows' (see `noise_condition_rows`).
+        condition_rows = self.noise_condition_rows(condition_latents, generator) if condition_latents else None
 
         video_rows, audio_rows = self.prepare_latents(
             num_latent_frames,
@@ -1049,6 +1215,10 @@ class MiniMaxH3Pipeline(nn.Module):
             latents=latents,
             audio_latents=audio_latents,
         )
+        if condition_rows is not None:
+            video_rows = torch.cat([condition_rows, video_rows])
+        if audio_condition_rows is not None:
+            audio_rows = torch.cat([audio_condition_rows.to(audio_rows.dtype), audio_rows])
 
         with _stage("denoise"):
             video_rows, audio_rows = self.denoise(
@@ -1061,7 +1231,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 {"video_rows": video_rows, "audio_rows": audio_rows, "prompt_embeds": prompt_embeds.cpu()},
                 dump,
             )
-        if self.vae is None:
+        if not self._decode:
             return DiffusionOutput(output=None)
 
         with _stage("decode_video"):

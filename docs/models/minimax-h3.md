@@ -17,7 +17,8 @@ holds the prompt, the audio latents and the video latents; a Qwen3-VL-32B model 
 2.4B-parameter ViT decoder turns its video latents into frames and a BigVGAN decoder turns its
 audio latents into a stereo waveform.
 
-MiniMax-H3 text-to-video-and-audio (`t2va`) is supported for inference with
+MiniMax-H3 text-to-video-and-audio (`t2va`), first/last-keyframe conditioning (`fl2va`) and
+image/video/audio reference conditioning (`ref2va`) are supported for inference with
 [vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) on AWS Trainium2 (`trn2`).
 
 | Model | HuggingFace | Hardware | Precision |
@@ -30,7 +31,9 @@ MiniMax-H3 text-to-video-and-audio (`t2va`) is supported for inference with
 |---|---|---|
 | **Generation** | Text-to-video-and-audio (`t2va`) | ✅ |
 | | 1344x768, 124 frames (5.2 s at 24 fps) | ✅ |
-| | Keyframe (`fl2va`) / reference (`ref2va`) conditioning | Not yet |
+| | First / last keyframe (`fl2va`) | ✅ |
+| | Image, video and audio references (`ref2va`) | ✅ |
+| | Prompt-length buckets (one graph per bucket) | ✅ |
 | **Parallelism** | Tensor Parallelism (TP) | ✅ |
 | | Context Parallelism (CP) | ✅ |
 | **Performance** | Spatial Tiling (VAE) | ✅ |
@@ -41,7 +44,9 @@ MiniMax-H3 text-to-video-and-audio (`t2va`) is supported for inference with
 
 | Component | Placement |
 |---|---|
-| Qwen3-VL conditioner | Host, rank 0; the embeddings are broadcast to every rank. About 1 s per request. |
+| Qwen3-VL conditioner | Host, rank 0; the embeddings are broadcast to every rank. About 1 s for a text prompt. |
+| Video encoder (`fl2va` keyframes, `ref2va` images and videos) | NeuronCores; the tiles are split over all ranks. |
+| Audio encoder (`ref2va` soundtracks) | Host, rank 0. |
 | DiT | NeuronCores, TP x CP. |
 | Video decoder | NeuronCores, replicated; the tiles of the clip are split over all ranks. |
 | Audio decoder | Host (default, ~1 s), or NeuronCores with `model_config.audio_vae_device: neuron`. |
@@ -69,6 +74,33 @@ python examples/minimax_h3/run.py \
 `run.py` defaults to the released recipe (1344x768, 124 frames, 50 steps) and writes an `.mp4`
 with the soundtrack muxed in. `--dev` runs a 704x384, 3-step, 2-layer smoke test.
 
+`fl2va` passes the keyframes as `multi_modal_data={"image": ..., "last_image": ...}` (either may be
+left out); the canvas follows the first keyframe's aspect ratio unless `height`/`width` are given:
+
+```bash
+python examples/minimax_h3/run.py --model-path MiniMaxAI/MiniMax-H3 --image first.png --last-image last.png
+```
+
+`ref2va` uses the checkpoint's second transformer partition (`transformer_ref/`), so it runs on a
+stage of its own: set `model_config: {task: ref2va}` under the stage's `engine_args` (`run.py` does
+this when given `--reference`). A request passes `multi_modal_data={"references": [...]}`, in the
+order the model should read them; each entry is `{"type": "image", "image": PIL.Image}`,
+`{"type": "video", "frames": (T, H, W, 3) uint8, "fps": ..., "audio": (C, N) | None,
+"sample_rate": ...}` or `{"type": "audio", "audio": (C, N), "sample_rate": ...}`:
+
+```bash
+python examples/minimax_h3/run.py --model-path MiniMaxAI/MiniMax-H3 \
+  --reference image:character.png --reference video:motion.mp4 --reference audio:voice.wav
+```
+
+### Prompt-length buckets
+
+The DiT graph specializes on the packed sequence length, which includes the prompt. The prompt is
+left-padded to the smallest length that makes the sequence a multiple of
+`model_config.text_bucket_align` (default 512), and the padding is masked out of attention with the
+kernel's KV bounds, so every prompt up to that length shares one graph and the sequence stays
+512-aligned. `text_bucket_align: 1` compiles a graph per exact prompt length.
+
 ## Accuracy
 
 DiT latents after two denoising steps, against the diffusers reference run on CPU in FP32. At
@@ -83,6 +115,19 @@ the same diffusers model run on NeuronCores is shown for comparison.
 | 704x384 | Diffusers on CPU, BF16 (floor) | 9.1% | 0.9959 | 3.2% |
 | 1344x768 | 64 cores (TP=8 x CP=8) | 5.5% | 0.9986 | 7.4% |
 | 1344x768 | Diffusers on 64 NeuronCores, BF16 | 23.2% | 0.9730 | 11.0% |
+
+`fl2va` (first and last keyframe) and `ref2va` (an image, a 1-second video with its soundtrack and a
+2-second audio clip; an 8243-token presentation), 704x384, same protocol:
+
+| Task | Configuration | Video rel. L2 | Audio rel. L2 |
+|---|---|---|---|
+| `fl2va` | 8 cores (TP=8) | 10.9% | 5.4% |
+| `fl2va` | Diffusers on CPU, BF16 (floor) | 10.0% | 5.8% |
+| `ref2va` | 16 cores (TP=8 x CP=2) | 13.8% | 8.1% |
+| `ref2va` | Diffusers on CPU, BF16 (floor) | 12.4% | 10.1% |
+
+Prompt buckets are exact: a 29-token prompt padded to its 58-row bucket and the same prompt
+unpadded land at 9.55% and 9.56% from the FP32 reference.
 
 Over a full 50-step generation, small numerical differences change the sample — the same scene
 and motion, with drifting camera framing — so frame-level metrics against another implementation
@@ -118,8 +163,12 @@ roughly 12 minutes at 64 cores and longer at fewer cores, once per geometry, the
 
 - **One device is not enough at 1344x768.** At `tensor_parallel_size=4` the DiT's compiled graph
   needs 29.7 GB of HBM per core against 24 GB.
-- **Each prompt length is its own graph.** The packed sequence includes the prompt tokens, and the
-  attention takes no mask, so a new prompt length compiles a new DiT graph.
+- **Each bucket is its own graph.** Prompts are grouped into length buckets (see above), but a prompt
+  past its bucket, a new canvas or frame count, and every `ref2va` reference set (whose geometry
+  enters the sequence) compile a new DiT graph.
+- **`ref2va` prompts are long.** Every image and video reference becomes a Qwen3-VL vision block in
+  the prompt — an image at its 2048-pixel short edge and a 1-second video are thousands of tokens
+  each — and its latents become as many DiT rows again.
 - **Cold compilation is per rank.** Every rank compiles its own NEFFs; a cold 64-core start runs
   64 compiles at once and needs on the order of 1 TB of host memory.
 - **Batch size is limited to one.**

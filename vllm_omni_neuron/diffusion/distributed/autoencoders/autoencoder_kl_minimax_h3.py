@@ -1013,7 +1013,7 @@ class NeuronMiniMaxH3VideoDecoder(nn.Module):
 
 
 class NeuronMiniMaxH3VideoEncoder(nn.Module):
-    """The CNN encoder + `quant_conv`, traced as one NEFF."""
+    """The CNN encoder + `quant_conv`, as one module (the eager path)."""
 
     def __init__(self, encoder: MiniMaxH3VideoEncoder3d, quant_conv: nn.Module):
         super().__init__()
@@ -1022,6 +1022,72 @@ class NeuronMiniMaxH3VideoEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self.quant_conv(self.encoder(x))
+
+
+class _EncoderStage(nn.Module):
+    """A run of consecutive encoder modules, traced as one NEFF."""
+
+    def __init__(self, *parts: nn.Module):
+        super().__init__()
+        self.parts = nn.ModuleList(parts)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for part in self.parts:
+            x = part(x)
+        return x
+
+
+class _EncoderHead(nn.Module):
+    def __init__(self, encoder: MiniMaxH3VideoEncoder3d, quant_conv: nn.Module):
+        super().__init__()
+        self.norm_out = encoder.norm_out
+        self.conv_out = encoder.conv_out
+        self.quant_conv = quant_conv
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.quant_conv(self.conv_out(F.silu(self.norm_out(x))))
+
+
+class _Drained(nn.Module):
+    """A stage that also returns one element of its output, for the host to read.
+
+    The Lite runtime retires an execution only once one of its outputs is read back to the
+    host; neither ``synchronize()`` nor freeing the outputs does. Chained stages whose
+    outputs stay in HBM therefore fill its execution queue after ~8 launches ("Execution
+    Queue Full"). Reading a one-element probe retires the launch for free.
+    """
+
+    def __init__(self, stage: nn.Module):
+        super().__init__()
+        self.stage = stage
+
+    def forward(self, x: torch.Tensor):
+        y = self.stage(x)
+        return y, y.reshape(-1)[:1] * 1
+
+
+def encoder_stages(encoder: MiniMaxH3VideoEncoder3d, quant_conv: nn.Module) -> list[nn.Module]:
+    """The encoder + `quant_conv` cut into stages that each compile as their own graph.
+
+    As one graph, the float32 encoder over a 17-frame 256x256 tile takes neuronx-cc over half an
+    hour and ~100 GB of host memory per rank — and every rank compiles its own. The cost sits in
+    the full-resolution blocks, so the first two down blocks are cut per resnet and the rest per
+    block. The activations between stages go through HBM: a few hundred MB per tile.
+    """
+
+    def block_parts(block):
+        return list(block.resnets) + list(block.downsamplers or [])
+
+    first, second = (block_parts(encoder.down_blocks[i]) for i in range(2))
+    stages = [
+        _EncoderStage(encoder.conv_in, first[0]),
+        _EncoderStage(*first[1:]),
+        _EncoderStage(second[0]),
+        _EncoderStage(*second[1:]),
+    ]
+    stages += [_EncoderStage(block) for block in encoder.down_blocks[2:]]
+    stages.append(_EncoderHead(encoder, quant_conv))
+    return stages
 
 
 # ===================================================================
@@ -1221,7 +1287,7 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
         chunk[..., :blend_extent, :, :].mul_(weight).add_(tail * (1 - weight))
         return chunk
 
-    def _run_tiles(self, tiles: list[torch.Tensor], run) -> list[torch.Tensor]:
+    def _run_tiles(self, tiles: list[torch.Tensor], run, batch_size: int | None = None) -> list[torch.Tensor]:
         """Push ``tiles`` through ``run`` in fixed-size batches, results on the host.
 
         Every tile has the same shape, so a batch is just a `cat` along the leading axis. The
@@ -1229,7 +1295,7 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
         left short: a shorter batch is a different graph shape, i.e. a second compile. The
         padding decodes to garbage that is dropped here.
         """
-        batch_size = self.tile_batch_size
+        batch_size = batch_size or self.tile_batch_size
         outputs: list[torch.Tensor] = []
         logger.info(
             "video VAE: %d tiles of %s in batches of %d",
@@ -1252,6 +1318,25 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
             with _phase("to_host"):
                 outputs.extend(self._to_host(per_tile[:num_real]))
         return outputs
+
+    def _run_tiles_shared(self, tiles: list[torch.Tensor], run, batch_size: int) -> list[torch.Tensor]:
+        """Run this rank's share of ``tiles`` and all-gather every share onto every rank's host.
+
+        The encoder's counterpart of `_run_tiles_split`: every rank needs the encoded
+        conditioning, and its tiles are latents (16x smaller per axis than the pixels), so an
+        all-gather over the CPU group is cheap.
+        """
+        num_groups = get_num_tile_groups()
+        if num_groups <= 1:
+            return self._run_tiles(tiles, run, batch_size)
+        start, end = tiles_for(len(tiles), num_groups, get_tile_group_index())
+        mine = self._run_tiles(tiles[start:end], run, batch_size) if end > start else []
+        if end <= start:
+            # Reach the one-time compile together with the other ranks (see `_run_tiles_split`).
+            self._run_tiles(tiles[:1], run, batch_size)
+        shares: list[list[torch.Tensor] | None] = [None] * num_groups
+        dist.all_gather_object(shares, mine)
+        return [tile for share in shares for tile in share]
 
     def _run_tiles_split(self, tiles: list[torch.Tensor], run) -> list[torch.Tensor] | None:
         """Decode this rank's share of ``tiles``, then gather every share on rank 0's host.
@@ -1427,7 +1512,7 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
     # ---------------------------------------------------------------
 
     def compile(self, *args, **compiler_kwargs):
-        """Trace the encoder and the decoder as one graph each.
+        """Trace the decoder as one graph and the encoder as `encoder_stages`.
 
         Every tile of a clip has the same shape, so both graphs are shape-static: the
         decoder sees ``(num_tiles, latent_channels, tokens_chunk_size + token_overlap,
@@ -1441,9 +1526,15 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
             **compiler_kwargs,
         )
         if not self._encoder_skipped:
-            self._compiled_encoder = torch.compile(
-                NeuronMiniMaxH3VideoEncoder(self.encoder, self.quant_conv), *args, **compiler_kwargs
-            )
+            # The stages share `_Drained.forward`, and dynamo caches graphs per code object:
+            # nine stages at two tile shapes (a keyframe, a video clip) exceed the default 8.
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 64)
+            self._compiled_encoder = [
+                torch.compile(_Drained(stage), *args, **compiler_kwargs)
+                for stage in encoder_stages(self.encoder, self.quant_conv)
+            ]
         return self
 
     # `is not None`, not `or`: an `nn.Module` defines no `__bool__`, so truth-testing one
@@ -1461,9 +1552,17 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
                 "The video VAE encoder was not built (`with_encoder=False`). It is only "
                 "needed to condition on a keyframe or a reference image."
             )
-        if self._compiled_encoder is not None:
-            return self._compiled_encoder
-        return NeuronMiniMaxH3VideoEncoder(self.encoder, self.quant_conv)
+        if self._compiled_encoder is None:
+            return NeuronMiniMaxH3VideoEncoder(self.encoder, self.quant_conv)
+        stages = self._compiled_encoder
+
+        def run(x: torch.Tensor) -> torch.Tensor:
+            for stage in stages:
+                x, probe = stage(x)
+                probe.to("cpu")  # retires the launch; see `_Drained`
+            return x
+
+        return run
 
     def _rotary_tables(self, num_frames: int, height: int, width: int, device: torch.device):
         """Fetch (or build) the host-side rotary tables for one latent tile shape."""
@@ -1518,9 +1617,11 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
             for i_pos, i_len in zip(y_indices, y_lengths)
             for j_pos, j_len in zip(x_indices, x_lengths)
         ]
-        # Several tiles per call rather than one each: within an axis every tile has the
-        # same length, so they stack cleanly along the batch dimension.
-        host_tiles = self._run_tiles(tiles, encoder)
+        # The tiles are spread over the ranks. A single frame runs several tiles per call; a
+        # multi-frame clip (a video reference) runs one, because the batched float32 encoder
+        # graph over 17-frame tiles takes neuronx-cc the better part of an hour to compile.
+        batch_size = self.tile_batch_size if x.shape[2] == 1 else 1
+        host_tiles = self._run_tiles_shared(tiles, encoder, batch_size)
 
         num_x = len(x_indices)
         rows = [host_tiles[i * num_x : (i + 1) * num_x] for i in range(len(y_indices))]

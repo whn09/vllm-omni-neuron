@@ -26,11 +26,12 @@ from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni_neuron.diffusion.distributed.parallel_state import get_cp_group
 
-# Each shard is rounded up to a multiple of this. LNC=2 splits the token axis of a row-wise matmul
-# across the two physical cores of a logical one and cannot halve an odd count. Aligning shards to
-# 128 rows was measured not to help (1.583 vs 1.570 s/step at 1344x768 on 64 cores): what the
-# attention kernel is sensitive to is the gathered key length, which drops the pad.
-SHARD_ALIGN = 2
+# Each shard is rounded up to a multiple of this: the attention kernel reads its KV bounds in
+# 128-query tiles, so a shard of any other length falls back to materialized attention (at a
+# ref2va-sized sequence that does not even compile). The pad rows trail the sequence, past the
+# kernel's `key_end`, so they never act as keys. The prompt bucket already makes the t2va
+# sequences 512-aligned, so their shards need no padding at 8 shards or fewer.
+SHARD_ALIGN = 128
 
 
 def tp_size() -> int:
