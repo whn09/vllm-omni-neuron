@@ -44,7 +44,7 @@ image/video/audio reference conditioning (`ref2va`) are supported for inference 
 
 | Component | Placement |
 |---|---|
-| Qwen3-VL conditioner | Host, rank 0; the embeddings are broadcast to every rank. About 1 s for a text prompt. |
+| Qwen3-VL conditioner | At 64 cores (`model_config.text_encoder_device: auto`, the default): its 50 decoder layers on every NeuronCore, sharded 64 ways (~0.8 GB/core); the embedding, vision tower and rotary/DeepStack inputs on the host (rank 0). Below 64 cores: all of it on the host (rank 0), the embeddings broadcast to every rank. |
 | Video encoder (`fl2va` keyframes, `ref2va` images and videos) | NeuronCores; the tiles are split over all ranks. |
 | Audio encoder (`ref2va` soundtracks) | Host, rank 0. |
 | DiT | NeuronCores, TP x CP. |
@@ -148,19 +148,26 @@ loading), measured end to end at the Omni entrypoint.
 
 | NeuronCores | Configuration | DiT s/step | Text encoder | DiT (49 steps) | Video decoder | Audio decoder | Request |
 |---|---|---|---|---|---|---|---|
-| 64 | TP=8 x CP=8 | 1.434 | 6.2 s | 73.1 s | 15.0 s | 1.0 s | **98.6 s** |
+| 64 | TP=8 x CP=8 | 1.429 | 0.16 s | 72.2 s | 13.9 s | 1.1 s | **89.2 s** |
 | 32 | TP=8 x CP=4 | 2.547 | 5.0 s | 126.8 s | 15.8 s | 1.2 s | **151.1 s** |
 | 16 | TP=8 x CP=2 | 5.013 | 2.8 s | 257.9 s | 16.1 s | 1.2 s | **280.4 s** |
 | 8 | TP=8 | 12.694 | 4.4 s | 623.5 s | 19.2 s | 1.3 s | **650.5 s** |
 | 4 | TP=4 | — | — | — | — | — | does not fit (see below) |
 
-The host text encoder's time varies between requests (0.9–6 s for the same prompt), with the
-other ranks waiting on it.
+The 64-core row runs the conditioner's decoder layers on NeuronCores (the default there); with
+them on the host the same request took 98.6 s, the host encoder taking 0.9–6 s for the same
+prompt. Below 64 cores the conditioner is on the host.
 
 `ref2va` at 1344x768 on 64 cores — an image, a 1-second video with its soundtrack and a 2-second
-audio clip (an 8243-token presentation, 60928 DiT rows) — takes **339.9 s** per request: about
-126 s of reference normalization and host text encoding, 40 s of reference encoding on Neuron,
-159 s of DiT (3.18 s/step, per-block graphs) and 15 s of decoding.
+audio clip (an 8243-token presentation, 60928 DiT rows) — takes **241.4 s** per request: 66 s to
+encode the references (the conditioner's vision tower on the host is ~24 s of it; the video VAE
+encoder on Neuron most of the rest), 158.6 s of DiT (3.19 s/step, per-block graphs) and 13.7 s of
+decoding. With the whole conditioner on the host it took 339.9 s. Peak HBM for this request is
+19.6 GiB per core of 24, conditioner weights not included.
+
+The conditioner on NeuronCores matches it on the host to 1.5e-3 (relative L2) for a text prompt;
+for the reference presentation above both are equally far from an FP32 run (text rows 1.6% vs
+1.3%, image rows 46.0% vs 45.7%, video rows 17.8% vs 17.6% — BF16 itself).
 
 A cold start compiles the DiT graph for the request's geometry: roughly 12 minutes at 64 cores and
 longer at fewer cores, once per geometry, then cached.
@@ -187,9 +194,13 @@ s/step).
   aligned sequence is the faster one (16–64 cores gain 8–14%).
 - **`ref2va` prompts are long.** Every image and video reference becomes a Qwen3-VL vision block in
   the prompt — an image at its 2048-pixel short edge and a 1-second video are thousands of tokens
-  each — and its latents become as many DiT rows again. The conditioner runs on the host, so such a
-  prompt takes about two minutes to encode, and the 704x384 test request does not fit 8 cores
-  (23.9 of 24 GB HBM).
+  each — and its latents become as many DiT rows again. Below 64 cores the whole conditioner runs
+  on the host (~95 s for that prompt), and the 704x384 test request does not fit 8 cores (23.9 of
+  24 GB HBM).
+- **The conditioner on NeuronCores needs the whole world.** Its 26B decoder parameters are ~6.5
+  GB/core at TP=8, more than the ~4 GiB of HBM a 64-core `ref2va` request leaves free, so the layers
+  are split over all ranks (at 64: ~0.8 GB/core). `auto` enables it only at 64 cores, where it was
+  validated; 32 cores (~1.6 GB/core) can opt in with `text_encoder_device: neuron`.
 - **Cold compilation is per rank.** Every rank compiles its own NEFFs; a cold 64-core start runs
   64 compiles at once and needs on the order of 1 TB of host memory.
 - **Batch size is limited to one.**

@@ -254,7 +254,15 @@ class MiniMaxH3Pipeline(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(
             model, subfolder="tokenizer", local_files_only=True
         )
-        self.text_encoder = MiniMaxH3TextEncoder(model, subfolder="text_encoder", dtype=dtype)
+        # `model_config.text_encoder_device`: `neuron` runs the conditioner's 50 decoder layers on
+        # every NeuronCore (~0.8 GB/core at 64), `cpu` on the host; `auto` (default) is `neuron`
+        # on 64 cores.
+        self.text_encoder = MiniMaxH3TextEncoder(
+            model,
+            subfolder="text_encoder",
+            dtype=dtype,
+            device=(od_config.model_config or {}).get("text_encoder_device", "auto"),
+        )
 
         # The stage yaml's `model_config` reaches the DiT here (e.g. `num_layers` for a dev run).
         transformer_config.update(dict(od_config.model_config or {}))
@@ -348,6 +356,8 @@ class MiniMaxH3Pipeline(nn.Module):
             component = getattr(self, attr, None)
             if component is not None:
                 component.to(*args, **kwargs)
+        if self.text_encoder.neuron_layers is not None:
+            self.text_encoder.neuron_layers.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
@@ -419,6 +429,16 @@ class MiniMaxH3Pipeline(nn.Module):
         if self.vae is not None:
             self.compile_vae(*args, **kwargs)
         self.compile_transformer(*args, **kwargs)
+        if self.text_encoder.neuron_layers is not None:
+            t_kwargs = copy.deepcopy(kwargs)
+            t_kwargs.setdefault("fullgraph", True)
+            t_kwargs.setdefault("options", {})["compiler_args"] = [
+                "--model-type=transformer",
+                "--auto-cast=none",
+                "-O1",
+                "--hbm-scratchpad-page-size=2048",
+            ]
+            self.text_encoder.neuron_layers.compile(lambda module: torch.compile(module, **t_kwargs))
         return self
 
     def _transformer_module(self, sequence_length: int):

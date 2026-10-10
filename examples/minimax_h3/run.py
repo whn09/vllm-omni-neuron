@@ -48,6 +48,12 @@ parser.add_argument(
     default=None,
     help="ref2va, in the order the model reads them: image:PATH, video:PATH (with its soundtrack) or audio:PATH.",
 )
+parser.add_argument(
+    "--text-encoder-device",
+    choices=("auto", "cpu", "neuron"),
+    default="auto",
+    help="Where the conditioner's decoder layers run; auto = all NeuronCores at 64 cores, else host.",
+)
 parser.add_argument("--repeat", type=int, default=1, help="Send the request N times, timing each.")
 parser.add_argument(
     "--prompt",
@@ -147,6 +153,8 @@ def main():
     model_config = {}
     if args.reference:
         model_config["task"] = "ref2va"
+    if args.text_encoder_device != "auto":
+        model_config["text_encoder_device"] = args.text_encoder_device
     if args.num_layers is not None or args.dev:
         model_config["num_layers"] = args.num_layers or 2
 
