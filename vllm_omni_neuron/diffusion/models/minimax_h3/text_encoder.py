@@ -78,6 +78,7 @@ class MiniMaxH3TextEncoder:
         # otherwise.
         self.device = device
         self.neuron_layers = None
+        self.neuron_vision = None
         self.model = None
         self.hidden_size = None
         self.image_token_id = None
@@ -115,6 +116,17 @@ class MiniMaxH3TextEncoder:
                 group,
             )
             self.neuron_layers.load_weights(self.dtype)
+            from vllm_omni_neuron.diffusion.models.minimax_h3.vision_neuron import (
+                NeuronQwen3VLVisionBlocks,
+            )
+
+            self.neuron_vision = NeuronQwen3VLVisionBlocks(
+                self.model_path,
+                world.rank_in_group if world is not None else 0,
+                world.world_size if world is not None else 1,
+                world if group is not None else None,
+            )
+            self.neuron_vision.load_weights(self.dtype)
         if not self._is_owner:
             return
 
@@ -211,10 +223,114 @@ class MiniMaxH3TextEncoder:
                 deepstack.append(dense)
         return embeds[0], cos[0], sin[0], deepstack
 
+    def compile(self, compile_fn) -> None:
+        """Compile the on-device decoder layers and vision blocks."""
+        if self.neuron_layers is not None:
+            self.neuron_layers.compile(compile_fn)
+        if self.neuron_vision is not None:
+            self.neuron_vision.compile(compile_fn)
+
+    @torch.no_grad()
+    def _vision_block_inputs(self, vision_inputs: dict) -> list[tuple]:
+        """Rank 0: each modality's vision-block inputs, as `Qwen3VLVisionModel.forward` builds them.
+
+        ``[(grid_thw, hidden, cos, sin, cu_seqlens), ...]`` for the images, then the videos —
+        the order transformers calls the vision tower in.
+        """
+        from transformers.vision_utils import (
+            get_vision_attention_seqlens,
+            get_vision_interpolation_indices_and_weights,
+            get_vision_position_ids,
+        )
+
+        visual = self.model.model.visual
+        prepared = []
+        with host_threads():
+            for pixels_key, grid_key in (("pixel_values", "image_grid_thw"), ("pixel_values_videos", "video_grid_thw")):
+                if pixels_key not in vision_inputs:
+                    continue
+                grid_thw = vision_inputs[grid_key]
+                indices, weights = get_vision_interpolation_indices_and_weights(
+                    grid_thw,
+                    num_grid_per_side=visual.num_grid_per_side,
+                    mode=visual.interpolation_mode,
+                    align_corners=visual.interpolation_align_corners,
+                    spatial_merge_size=visual.config.spatial_merge_size,
+                )
+                position_ids = get_vision_position_ids(grid_thw, visual.spatial_merge_size)
+                cu_seqlens, _ = get_vision_attention_seqlens(grid_thw, visual.config)
+                hidden = visual.patch_embed(vision_inputs[pixels_key].to(self.dtype))
+                hidden = hidden + (visual.pos_embed(indices) * weights[:, :, None]).sum(1).to(hidden.dtype)
+                rotary = visual.rotary_pos_emb(position_ids).reshape(hidden.shape[0], -1)
+                emb = torch.cat((rotary, rotary), dim=-1)
+                prepared.append((grid_thw, hidden, emb.cos(), emb.sin(), cu_seqlens))
+        return prepared
+
+    def _run_vision_blocks(self, prepared: list[tuple]) -> list[tuple]:
+        """Every rank: one pass of the vision blocks over all modalities' patches.
+
+        Returns ``[(grid_thw, final, taps), ...]`` per modality, on the host.
+        """
+        offsets, hiddens, coss, sins, edges = [0], [], [], [], [0]
+        for _, hidden, cos, sin, cu_seqlens in prepared:
+            hiddens.append(hidden)
+            coss.append(cos)
+            sins.append(sin)
+            edges.extend((cu_seqlens[1:] + offsets[-1]).tolist())
+            offsets.append(offsets[-1] + hidden.shape[0])
+        final, taps = self.neuron_vision(
+            torch.cat(hiddens), torch.cat(coss), torch.cat(sins), torch.tensor(edges, dtype=torch.int32)
+        )
+        results = []
+        for (grid_thw, *_), start, end in zip(prepared, offsets[:-1], offsets[1:]):
+            results.append((grid_thw, final[start:end], {index: tap[start:end] for index, tap in taps.items()}))
+        return results
+
+    def _served_vision_forward(self, results: list[tuple]):
+        """A `Qwen3VLVisionModel.forward` that returns the blocks' precomputed results."""
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            BaseModelOutputWithDeepstackFeatures,
+        )
+
+        visual = self.model.model.visual
+
+        def forward(hidden_states, grid_thw, **kwargs):
+            for grid, final, taps in results:
+                if grid.shape == grid_thw.shape and torch.equal(grid, grid_thw):
+                    break
+            else:
+                raise RuntimeError("The vision tower was called on inputs it was not prepared for.")
+            deepstack = [
+                visual.deepstack_merger_list[position](taps[index])
+                for position, index in enumerate(visual.deepstack_visual_indexes)
+            ]
+            return BaseModelOutputWithDeepstackFeatures(
+                last_hidden_state=final, pooler_output=visual.merger(final), deepstack_features=deepstack
+            )
+
+        return forward
+
     def _encode_on_neuron(self, token_ids: list[int], vision_inputs: dict | None) -> torch.Tensor:
         from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder_neuron import TEXT_BUCKET
 
-        inputs = self._layer_inputs(token_ids, vision_inputs) if self._is_owner else None
+        # The vision blocks run on every rank, so their inputs are broadcast first.
+        on_neuron = self.neuron_vision is not None and os.environ.get("MINIMAX_H3_VISION_ON_HOST") != "1"
+        prepared = None
+        if on_neuron and self._is_owner and vision_inputs:
+            prepared = self._vision_block_inputs(vision_inputs)
+        prepared = broadcast_from_owner(prepared) if on_neuron else None
+        visual, original = None, None
+        if prepared:
+            results = self._run_vision_blocks(prepared)
+            if self._is_owner:
+                visual = self.model.model.visual
+                original = visual.forward
+                visual.forward = self._served_vision_forward(results)
+        try:
+            inputs = self._layer_inputs(token_ids, vision_inputs) if self._is_owner else None
+        finally:
+            if visual is not None:
+                visual.forward = original
         embeds, cos, sin, deepstack = broadcast_from_owner(inputs)
         length = embeds.shape[0]
         bucket = -(-length // TEXT_BUCKET) * TEXT_BUCKET

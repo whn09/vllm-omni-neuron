@@ -356,8 +356,9 @@ class MiniMaxH3Pipeline(nn.Module):
             component = getattr(self, attr, None)
             if component is not None:
                 component.to(*args, **kwargs)
-        if self.text_encoder.neuron_layers is not None:
-            self.text_encoder.neuron_layers.to(*args, **kwargs)
+        for module in (self.text_encoder.neuron_layers, self.text_encoder.neuron_vision):
+            if module is not None:
+                module.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
@@ -438,7 +439,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 "-O1",
                 "--hbm-scratchpad-page-size=2048",
             ]
-            self.text_encoder.neuron_layers.compile(lambda module: torch.compile(module, **t_kwargs))
+            self.text_encoder.compile(lambda module: torch.compile(module, **t_kwargs))
         return self
 
     def _transformer_module(self, sequence_length: int):

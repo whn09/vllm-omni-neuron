@@ -44,7 +44,7 @@ image/video/audio reference conditioning (`ref2va`) are supported for inference 
 
 | Component | Placement |
 |---|---|
-| Qwen3-VL conditioner | At 64 cores (`model_config.text_encoder_device: auto`, the default): its 50 decoder layers on every NeuronCore, sharded 64 ways (~0.8 GB/core); the embedding, vision tower and rotary/DeepStack inputs on the host (rank 0). Below 64 cores: all of it on the host (rank 0), the embeddings broadcast to every rank. |
+| Qwen3-VL conditioner | At 64 cores (`model_config.text_encoder_device: auto`, the default): its 50 decoder layers on every NeuronCore, sharded 64 ways (~0.8 GB/core), and the vision tower's 27 blocks on every NeuronCore, the patch rows split 64 ways (0.9 GB/core of replicated weights); the token embedding, patch embedding, rotary/DeepStack inputs and patch mergers on the host (rank 0). Below 64 cores: all of it on the host (rank 0), the embeddings broadcast to every rank. |
 | Video encoder (`fl2va` keyframes, `ref2va` images and videos) | NeuronCores; the tiles are split over all ranks. |
 | Audio encoder (`ref2va` soundtracks) | Host, rank 0. |
 | DiT | NeuronCores, TP x CP. |
@@ -159,15 +159,23 @@ them on the host the same request took 98.6 s, the host encoder taking 0.9–6 s
 prompt. Below 64 cores the conditioner is on the host.
 
 `ref2va` at 1344x768 on 64 cores — an image, a 1-second video with its soundtrack and a 2-second
-audio clip (an 8243-token presentation, 60928 DiT rows) — takes **241.4 s** per request: 66 s to
-encode the references (the conditioner's vision tower on the host is ~24 s of it; the video VAE
-encoder on Neuron most of the rest), 158.6 s of DiT (3.19 s/step, per-block graphs) and 13.7 s of
-decoding. With the whole conditioner on the host it took 339.9 s. Peak HBM for this request is
-19.6 GiB per core of 24, conditioner weights not included.
+audio clip (an 8243-token presentation, 60928 DiT rows) — takes **222.7 s** per request: 47.9 s to
+encode the references (most of it the video VAE encoder), 158.9 s of DiT (3.19 s/step, per-block
+graphs) and 13.0 s of decoding. With the whole conditioner on the host it took 339.9 s. Peak HBM
+for this request is 22.1 GiB per core of 24 (19.6 without the conditioner on NeuronCores).
 
-The conditioner on NeuronCores matches it on the host to 1.5e-3 (relative L2) for a text prompt;
-for the reference presentation above both are equally far from an FP32 run (text rows 1.6% vs
-1.3%, image rows 46.0% vs 45.7%, video rows 17.8% vs 17.6% — BF16 itself).
+The conditioner on NeuronCores matches it on the host to 1.5e-3 (relative L2) for a text prompt.
+For the reference presentation above, against an FP32 run of the reference implementation:
+
+| Rows | Conditioner on the host (BF16) | On NeuronCores |
+|---|---|---|
+| text | 1.3% | 1.6% |
+| image | 45.7% | 18.2% |
+| video | 17.6% | 19.4% |
+
+The image rows are closer on NeuronCores because the vision tower's LayerNorms accumulate in FP32
+there. (The FP32 run's video frames were decoded once more than these, so the video rows carry a
+small input difference on both sides.)
 
 A cold start compiles the DiT graph for the request's geometry: roughly 12 minutes at 64 cores and
 longer at fewer cores, once per geometry, then cached.
