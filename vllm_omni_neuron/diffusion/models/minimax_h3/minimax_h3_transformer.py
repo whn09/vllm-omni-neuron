@@ -279,6 +279,28 @@ def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch
 _ROW_CHUNK = 16384
 
 
+#: Staged launches allowed in flight before the oldest probe is read back (see `_Probed`).
+_MAX_IN_FLIGHT = 4
+
+
+class _Probed(nn.Module):
+    """``fn``'s outputs plus one element of its first tensor output, for the host to read.
+
+    The Lite runtime retires an execution only when one of its outputs is read back to the
+    host — neither ``synchronize()`` nor freeing the outputs does — so a chain of graphs whose
+    outputs stay in HBM fills its execution queue after ~8 launches.
+    """
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, *args):
+        outputs = self.fn(*args)
+        first = outputs[0] if isinstance(outputs, tuple) else outputs
+        return outputs, first.reshape(-1)[:1] * 1
+
+
 def _rowwise(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``layer(x)`` for a row-wise ``layer``, over ``(B, rows, C)`` in chunks of `_ROW_CHUNK` rows."""
     if x.shape[1] <= _ROW_CHUNK:
@@ -712,6 +734,8 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
         register_replica_groups(tp_size=parallel.tp_size(), cp_size=self.cp_size)
         # Resolved here rather than in `forward`: a Python-side lookup Dynamo cannot trace.
         self.cp_group = get_cp_group() if self.cp_size > 1 else None
+        # Set by `compile_stages`; None runs (or traces) the whole forward as one graph.
+        self._stage_compiler = None
 
         # 1. Per-modality input projections. Small and float32 in the checkpoint, so
         # left replicated.
@@ -845,6 +869,122 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             ``hidden_states`` and the audio velocity in the row order of
             ``audio_hidden_states``.
         """
+        if self._stage_compiler is not None:
+            return self._forward_staged(
+                hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
+                rotary_cos, rotary_sin, adaln_run_rows, norm_out_run_rows, num_text_tokens, row_runs,
+            )
+        return self._forward_whole(
+            hidden_states=hidden_states, audio_hidden_states=audio_hidden_states,
+            encoder_hidden_states=encoder_hidden_states, timestep=timestep, rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin, adaln_run_rows=adaln_run_rows, norm_out_run_rows=norm_out_run_rows,
+            num_text_tokens=num_text_tokens, row_runs=row_runs,
+        )
+
+    def _forward_whole(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        encoder_hidden_states,
+        timestep,
+        rotary_cos,
+        rotary_sin,
+        adaln_run_rows,
+        norm_out_run_rows,
+        num_text_tokens,
+        row_runs: MiniMaxH3RowRuns,
+    ):
+        hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = self._prologue(
+            hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
+            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs,
+        )
+        runs, context = self._block_geometry(row_runs, key_start)
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+        return self._epilogue(hidden_states, temb, norm_out_run_rows, row_runs)
+
+    def compile_stages(self, compile_fn) -> None:
+        """Compile the DiT as a prologue, one graph per transformer block and an epilogue.
+
+        The blocks are structurally identical and their weights are graph inputs, so they share
+        one NEFF: a cold start compiles one block instead of a 50-block graph, and sequences
+        whose whole-model graph does not finish compiling (~60K rows) become usable. Every
+        launch returns a one-element probe that is read back, which is what retires a launch
+        on the Lite runtime (see `_Probed`).
+        """
+        import torch._dynamo.config as dynamo_config
+
+        # One trace per block module; the default cache limit per code object is 8.
+        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 4 * len(self.transformer_blocks))
+        self._stage_compiler = {
+            "prologue": compile_fn(_Probed(self._prologue)),
+            "blocks": [compile_fn(_Probed(block)) for block in self.transformer_blocks],
+            "epilogue": compile_fn(self._epilogue),
+        }
+
+    def _forward_staged(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        encoder_hidden_states,
+        timestep,
+        rotary_cos,
+        rotary_sin,
+        adaln_run_rows,
+        norm_out_run_rows,
+        num_text_tokens,
+        row_runs: MiniMaxH3RowRuns,
+    ):
+        stages = self._stage_compiler
+        outputs, probe = stages["prologue"](
+            hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
+            rotary_cos, rotary_sin, adaln_run_rows, num_text_tokens, row_runs,
+        )
+        pending = [probe]
+        hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start = outputs
+        runs, context = self._block_geometry(row_runs, key_start)
+        for block in stages["blocks"]:
+            hidden_states, probe = block(hidden_states, temb, runs, adaln_run_rows, (rotary_cos, rotary_sin), context)
+            pending.append(probe)
+            # Keep a few launches in flight, well under the runtime's queue depth (~8).
+            while len(pending) > _MAX_IN_FLIGHT:
+                pending.pop(0).to("cpu")
+        for probe in pending:
+            probe.to("cpu")
+        return stages["epilogue"](hidden_states, temb, norm_out_run_rows, row_runs)
+
+    def _block_geometry(self, row_runs: MiniMaxH3RowRuns, key_start: torch.Tensor):
+        """This rank's run spans and attention context: static geometry, computed in Python."""
+        runs = row_runs.runs
+        if self.cp_size <= 1:
+            return runs, _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
+        shard = parallel.sequence_shard(row_runs.sequence_length, self.cp_size, self.cp_rank)
+        runs, _ = parallel.shard_runs(
+            runs,
+            torch.zeros(len(runs), dtype=torch.long),
+            shard.start,
+            min(shard.end, row_runs.sequence_length),
+            pad_to=shard.shard_length,
+        )
+        return runs, _AttentionContext(key_start, row_runs.sequence_length, cp_group=self.cp_group)
+
+    def _prologue(
+        self,
+        hidden_states,
+        audio_hidden_states,
+        encoder_hidden_states,
+        timestep,
+        rotary_cos,
+        rotary_sin,
+        adaln_run_rows,
+        num_text_tokens,
+        row_runs: MiniMaxH3RowRuns,
+    ):
+        """Embed the three streams, refine the prompt, pack and (under CP) shard the sequence.
+
+        Returns ``(hidden_states, temb, adaln_run_rows, rotary_cos, rotary_sin, key_start)``
+        for this rank's rows.
+        """
         rotary_emb = (rotary_cos, rotary_sin)
         num_condition_rows = row_runs.num_condition_rows
 
@@ -889,7 +1029,6 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             ],
             dim=1,
         )
-        context = _AttentionContext(key_start=key_start, key_end=row_runs.sequence_length)
 
         # 2. One timestep embedding per distinct noise level. `temb` is shared by all
         # AdaLN projections, which are bfloat16 while `time_embedder` is float32, so it
@@ -912,19 +1051,21 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
             # The rotary tables are `(seq_len, ...)`, so they shard on dim 0 and have to cover
             # exactly the rows Q now holds.
             rotary_emb = tuple(table[shard.start : shard.end].contiguous() for table in rotary_emb)
-            runs, adaln_run_rows = parallel.shard_runs(
+            _, adaln_run_rows = parallel.shard_runs(
                 runs,
                 adaln_run_rows,
                 shard.start,
                 min(shard.end, sequence_length),
                 pad_to=shard.shard_length,
             )
-            context = _AttentionContext(key_start, row_runs.sequence_length, cp_group=self.cp_group)
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, temb, runs, adaln_run_rows, rotary_emb, context)
+        return hidden_states, temb, adaln_run_rows, rotary_emb[0], rotary_emb[1], key_start
 
-        if context.cp_group is not None:
+    def _epilogue(self, hidden_states, temb, norm_out_run_rows, row_runs: MiniMaxH3RowRuns):
+        """Gather the shards (under CP), normalize the media rows and run the two output heads."""
+        num_text_rows = row_runs.num_text_rows
+        num_condition_rows = row_runs.num_condition_rows
+        if self.cp_size > 1:
             # Back to full length before the output heads, so `norm_out`'s run spans stay in
             # absolute coordinates.
             hidden_states = self.cp_group.all_gather(hidden_states.contiguous(), dim=1)

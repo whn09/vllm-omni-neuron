@@ -142,22 +142,37 @@ The decoders, given the same latents as the diffusers decoders (1344x768, 124 fr
 
 ## Performance
 
-1344x768, 124 frames (5.2 s with audio), 50 steps, one `trn2.48xlarge`. Each row is the second of
-two identical requests in one process (the first also pays one-time graph loading), measured end to
-end at the Omni entrypoint.
+1344x768, 124 frames (5.2 s with audio), 50 steps, one `trn2.48xlarge`, a 29-token `t2va` prompt.
+Each row is the second of two identical requests in one process (the first also pays one-time graph
+loading), measured end to end at the Omni entrypoint.
 
 | NeuronCores | Configuration | DiT s/step | Text encoder | DiT (49 steps) | Video decoder | Audio decoder | Request |
 |---|---|---|---|---|---|---|---|
-| 64 | TP=8 x CP=8 | 1.570 | 1.7 s | 79.2 s | 13.0 s | 1.0 s | **97.5 s** |
-| 32 | TP=8 x CP=4 | 2.969 | 2.8 s | 146.8 s | 13.2 s | 1.0 s | **165.6 s** |
-| 16 | TP=8 x CP=2 | 5.770 | 2.7 s | 284.0 s | 14.0 s | 0.9 s | **303.3 s** |
-| 8 | TP=8 | 11.340 | 2.6 s | 557.3 s | 15.8 s | 0.9 s | **578.4 s** |
+| 64 | TP=8 x CP=8 | 1.434 | 6.2 s | 73.1 s | 15.0 s | 1.0 s | **98.6 s** |
+| 32 | TP=8 x CP=4 | 2.547 | 5.0 s | 126.8 s | 15.8 s | 1.2 s | **151.1 s** |
+| 16 | TP=8 x CP=2 | 5.013 | 2.8 s | 257.9 s | 16.1 s | 1.2 s | **280.4 s** |
+| 8 | TP=8 | 12.694 | 4.4 s | 623.5 s | 19.2 s | 1.3 s | **650.5 s** |
 | 4 | TP=4 | — | — | — | — | — | does not fit (see below) |
 
-The DiT scales close to linearly: 64 cores are 7.2x faster than 8.
+The host text encoder's time varies between requests (0.9–6 s for the same prompt), with the
+other ranks waiting on it.
 
-A cold start compiles the DiT graph for the request's resolution, frame count and prompt length:
-roughly 12 minutes at 64 cores and longer at fewer cores, once per geometry, then cached.
+`ref2va` at 1344x768 on 64 cores — an image, a 1-second video with its soundtrack and a 2-second
+audio clip (an 8243-token presentation, 60928 DiT rows) — takes **339.9 s** per request: about
+126 s of reference normalization and host text encoding, 40 s of reference encoding on Neuron,
+159 s of DiT (3.18 s/step, per-block graphs) and 15 s of decoding.
+
+A cold start compiles the DiT graph for the request's geometry: roughly 12 minutes at 64 cores and
+longer at fewer cores, once per geometry, then cached.
+
+### Per-block graphs for long sequences
+
+Sequences of at least `model_config.compile_per_block_min_rows` rows (default 49152) run the DiT
+as one graph per transformer block — structurally identical, so all 50 share one NEFF — plus a
+prologue and an epilogue. The whole-model graph of a ~60K-row `ref2va` request did not finish
+compiling in 4 hours; per-block it compiles in ~15 minutes. Each block launch costs ~8 ms, so
+shorter sequences keep the whole-model graph (at 704x384 on 8 cores per-block is 2.49 vs 2.10
+s/step).
 
 ## Known limitations
 
@@ -166,9 +181,15 @@ roughly 12 minutes at 64 cores and longer at fewer cores, once per geometry, the
 - **Each bucket is its own graph.** Prompts are grouped into length buckets (see above), but a prompt
   past its bucket, a new canvas or frame count, and every `ref2va` reference set (whose geometry
   enters the sequence) compile a new DiT graph.
+- **Without context parallelism, short prompts lost ~12%.** At 8 cores a 29-token prompt used to
+  run unpadded (37739 rows, 11.340 s/step); its bucket is now the aligned 37888 rows (12.694), which
+  is what an unpadded 178-token prompt always cost (12.624 on the previous code). With CP the
+  aligned sequence is the faster one (16–64 cores gain 8–14%).
 - **`ref2va` prompts are long.** Every image and video reference becomes a Qwen3-VL vision block in
   the prompt — an image at its 2048-pixel short edge and a 1-second video are thousands of tokens
-  each — and its latents become as many DiT rows again.
+  each — and its latents become as many DiT rows again. The conditioner runs on the host, so such a
+  prompt takes about two minutes to encode, and the 704x384 test request does not fit 8 cores
+  (23.9 of 24 GB HBM).
 - **Cold compilation is per rank.** Every rank compiles its own NEFFs; a cold 64-core start runs
   64 compiles at once and needs on the order of 1 TB of host memory.
 - **Batch size is limited to one.**

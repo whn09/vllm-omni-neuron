@@ -197,6 +197,17 @@ def _component_config(model_path: str, subfolder: str, filename: str) -> dict:
     return {key: value for key, value in config.items() if not key.startswith("_")}
 
 
+class _WholeGraph(nn.Module):
+    """The DiT's whole forward as one module, for `torch.compile` to trace end to end."""
+
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, **kwargs):
+        return self.transformer._forward_whole(**kwargs)
+
+
 class MiniMaxH3Pipeline(nn.Module):
     """MiniMax-H3 for Neuron: ``t2va``, ``fl2va`` and ``ref2va``.
 
@@ -311,6 +322,16 @@ class MiniMaxH3Pipeline(nn.Module):
         self.skip_warmup = True
         self._warmed_up = False
 
+        # Sequences of at least `model_config.compile_per_block_min_rows` rows run the DiT as one
+        # graph per block (shared by all 50) plus a prologue and an epilogue: a ~60K-row
+        # whole-model graph does not finish compiling, while per-block graphs cost ~8 ms of
+        # launch overhead per block per step, so shorter sequences keep the whole graph.
+        self._per_block_min_rows = int(
+            os.environ.get(
+                "MINIMAX_H3_PER_BLOCK_MIN_ROWS",
+                (od_config.model_config or {}).get("compile_per_block_min_rows", 48 * 1024),
+            )
+        )
         self._transformer_compile_kwargs: dict | None = None
         self._compiled_transformer = None
         self._qwen_processor = None
@@ -400,13 +421,19 @@ class MiniMaxH3Pipeline(nn.Module):
         self.compile_transformer(*args, **kwargs)
         return self
 
-    def _transformer_module(self):
+    def _transformer_module(self, sequence_length: int):
+        """The DiT as one whole-model graph, or — for sequences of at least
+        `_per_block_min_rows` rows — as per-block graphs (see `compile_stages`)."""
         if self._transformer_compile_kwargs is None:
             return self.transformer
+        kwargs = self._transformer_compile_kwargs
+        if sequence_length >= self._per_block_min_rows:
+            if self.transformer._stage_compiler is None:
+                self.transformer.compile_stages(lambda module: torch.compile(module, **kwargs))
+            return self.transformer
         if self._compiled_transformer is None:
-            self._compiled_transformer = torch.compile(
-                self.transformer, **self._transformer_compile_kwargs
-            )
+            # The whole-model trace must not take the staged path.
+            self._compiled_transformer = torch.compile(_WholeGraph(self.transformer), **kwargs)
         return self._compiled_transformer
 
     # ------------------------------------------------------------------
@@ -741,7 +768,7 @@ class MiniMaxH3Pipeline(nn.Module):
         ).to(self.device)
         num_text_tokens = torch.tensor([num_text], dtype=torch.int32).to(self.device)
 
-        transformer = self._transformer_module()
+        transformer = self._transformer_module(row_runs.sequence_length)
         # This line is where every stage-level timing analysis finds the denoise window, so it
         # reports the steps that will actually run, not the schedule's length.
         num_steps = min(timesteps.numel(), audio_timesteps.numel())
