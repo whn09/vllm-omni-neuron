@@ -81,6 +81,7 @@ from vllm_omni_neuron.diffusion.models.minimax_h3.keyframes import (
 from vllm_omni_neuron.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3RowRuns,
     NeuronMiniMaxH3Transformer3DModel,
+    WholeGraph,
 )
 from vllm_omni_neuron.diffusion.models.minimax_h3.packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -196,17 +197,6 @@ def _component_config(model_path: str, subfolder: str, filename: str) -> dict:
     """Read one component's config, dropping the ``_``-prefixed diffusers bookkeeping."""
     config = _read_json(os.path.join(model_path, subfolder, filename))
     return {key: value for key, value in config.items() if not key.startswith("_")}
-
-
-class _WholeGraph(nn.Module):
-    """The DiT's whole forward as one module, for `torch.compile` to trace end to end."""
-
-    def __init__(self, transformer):
-        super().__init__()
-        self.transformer = transformer
-
-    def forward(self, **kwargs):
-        return self.transformer._forward_whole(**kwargs)
 
 
 class MiniMaxH3Pipeline(nn.Module):
@@ -455,7 +445,7 @@ class MiniMaxH3Pipeline(nn.Module):
             return self.transformer
         if self._compiled_transformer is None:
             # The whole-model trace must not take the staged path.
-            self._compiled_transformer = torch.compile(_WholeGraph(self.transformer), **kwargs)
+            self._compiled_transformer = torch.compile(WholeGraph(self.transformer), **kwargs)
         return self._compiled_transformer
 
     # ------------------------------------------------------------------
@@ -590,23 +580,29 @@ class MiniMaxH3Pipeline(nn.Module):
         soundtrack rows are clean (``t = 1.0``) and already normalized.
         """
         num_latent_frames, latent_height, latent_width, num_audio_latents = geometry
-        normalized = normalize_references(parse_references(references), num_frames, self.audio_sampling_rate)
-        token_ids, token_tags, vision_inputs = reference_presentation(
-            self.tokenizer, self._processor(), normalized, prompt
-        )
-        prompt_embeds = self.text_encoder.encode(token_ids, vision_inputs).to(dtype=self._dtype)
+        with _stage("references.normalize"):
+            normalized = normalize_references(parse_references(references), num_frames, self.audio_sampling_rate)
+        with _stage("references.presentation"):
+            token_ids, token_tags, vision_inputs = reference_presentation(
+                self.tokenizer, self._processor(), normalized, prompt
+            )
+        with _stage("references.conditioner"):
+            prompt_embeds = self.text_encoder.encode(token_ids, vision_inputs).to(dtype=self._dtype)
 
-        condition_latents = [
-            self._condition_latents(reference_pixels(reference), chunked=reference.kind == "video")
-            for reference in normalized
-            if reference.kind in ("image", "video")
-        ]
+        condition_latents = []
+        for reference in normalized:
+            if reference.kind in ("image", "video"):
+                with _stage(f"references.vae_{reference.kind}"):
+                    condition_latents.append(
+                        self._condition_latents(reference_pixels(reference), chunked=reference.kind == "video")
+                    )
         # Rank 0 encodes the soundtracks on the host and every rank receives the rows.
         audio_rows = None
-        if self.text_encoder._is_owner:
-            with host_threads():
-                audio_rows = [self.audio_encoder.encode(r.audio) for r in normalized if r.has_audio]
-        audio_rows = broadcast_from_owner(audio_rows)
+        with _stage("references.audio"):
+            if self.text_encoder._is_owner:
+                with host_threads():
+                    audio_rows = [self.audio_encoder.encode(r.audio) for r in normalized if r.has_audio]
+            audio_rows = broadcast_from_owner(audio_rows)
 
         layout = build_ref2va_packed_sequence(
             text_token_tags=token_tags,

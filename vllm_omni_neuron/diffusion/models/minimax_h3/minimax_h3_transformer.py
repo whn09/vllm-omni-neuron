@@ -1177,3 +1177,20 @@ class NeuronMiniMaxH3Transformer3DModel(nn.Module):
                 state_dict[name] = tensor.to(target_dtype)
 
         self.load_state_dict(state_dict, strict=False, assign=True)
+
+
+class WholeGraph(nn.Module):
+    """The DiT's whole forward as one module, for `torch.compile` to trace end to end.
+
+    Defined here, after everything it traces, rather than next to the pipeline: the compiled
+    graph's cache key covers its source locations, so this keeps pipeline edits from
+    invalidating a ~12-minute compile.
+    """
+
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, **kwargs):
+        return self.transformer._forward_whole(**kwargs)
+
