@@ -90,6 +90,75 @@ def get_tile_group_index() -> int:
     return dist.get_rank() if dist.is_initialized() else 0
 
 
+_GATHER_CALLS = 0
+_SAME_HOST: bool | None = None
+
+
+def _cpu_group():
+    from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+    return get_world_group().cpu_group
+
+
+def _all_on_one_host() -> bool:
+    """Whether every rank runs on this host (asked once, over the default group)."""
+    global _SAME_HOST
+    if _SAME_HOST is None:
+        import socket
+
+        hosts = [None] * dist.get_world_size()
+        dist.all_gather_object(hosts, socket.gethostname(), group=_cpu_group())
+        _SAME_HOST = len(set(hosts)) == 1
+    return _SAME_HOST
+
+
+def _gather_to_rank0(mine: list[torch.Tensor], num_groups: int, rank: int) -> list | None:
+    """Every rank's host tensors on rank 0, in rank order; ``None`` elsewhere.
+
+    On one host the tensors go through shared memory: each rank writes its own to ``/dev/shm``
+    and rank 0 maps them back after a barrier, at memory speed. A 1344x768 clip is ~1 GB of
+    decoded tiles, which an object gather pickles and pushes through the CPU group's sockets —
+    6 s, most of the decode. Across hosts that is the fallback.
+    """
+    if not _all_on_one_host():
+        shares = [None] * num_groups if rank == 0 else None
+        dist.gather_object(mine, shares, dst=0)
+        return shares
+    global _GATHER_CALLS
+    _GATHER_CALLS += 1
+    import numpy as np
+
+    # Every worker is a child of the same executor process, and they call this in lockstep.
+    # Raw .npy rather than `torch.save`, which consults the (unimplemented) Lite device hooks
+    # even for host tensors; bfloat16 travels as its int16 bits.
+    def path(index: int) -> str:
+        return f"/dev/shm/minimax_h3_{os.getppid()}_{_GATHER_CALLS}_{index}.npy"
+
+    dtype = mine[0].dtype if mine else None
+    if mine:
+        stacked = torch.stack([tile.contiguous() for tile in mine])
+        array = (stacked.view(torch.int16) if dtype == torch.bfloat16 else stacked).numpy()
+    else:
+        array = np.zeros((0,), dtype=np.float16)
+    np.save(path(rank), array)
+    dtypes = [None] * num_groups if rank == 0 else None
+    dist.gather_object(dtype, dtypes, dst=0, group=_cpu_group())
+    if rank != 0:
+        return None
+    shares = []
+    for index in range(num_groups):
+        array = np.load(path(index), mmap_mode="r")
+        os.unlink(path(index))
+        if dtypes[index] is None:
+            shares.append([])
+            continue
+        stacked = torch.from_numpy(array)
+        if dtypes[index] == torch.bfloat16:
+            stacked = stacked.view(torch.bfloat16)
+        shares.append(list(stacked.unbind(0)))
+    return shares
+
+
 def tiles_for(num_tiles: int, num_groups: int, group_index: int) -> tuple[int, int]:
     """The ``[start, end)`` tiles ``group_index`` decodes, the leading groups taking the extra."""
     per_group = -(-num_tiles // num_groups)
@@ -1367,9 +1436,8 @@ class NeuronAutoencoderKLMiniMaxH3(nn.Module):
         if end <= start:
             self._run_tiles(tiles[:1], run)
         rank = get_tile_group_index()
-        shares: list[list[torch.Tensor] | None] | None = [None] * num_groups if rank == 0 else None
         with _phase("tile_gather"):
-            dist.gather_object(mine, shares, dst=0)
+            shares = _gather_to_rank0(mine, num_groups, rank)
         if rank != 0:
             return None
         gathered = [tile for share in shares for tile in share]

@@ -48,7 +48,7 @@ image/video/audio reference conditioning (`ref2va`) are supported for inference 
 | Video encoder (`fl2va` keyframes, `ref2va` images and videos) | NeuronCores; the tiles are split over all ranks. |
 | Audio encoder (`ref2va` soundtracks) | Host, rank 0. |
 | DiT | NeuronCores, TP x CP. |
-| Video decoder | NeuronCores, replicated; the tiles of the clip are split over all ranks. |
+| Video decoder | NeuronCores, replicated; the tiles of the clip are split over all ranks and handed to rank 0 through shared memory (one host), which stitches them multi-threaded. |
 | Audio decoder | Host (default, ~1 s), or NeuronCores with `model_config.audio_vae_device: neuron`. |
 
 ### Recommended configuration
@@ -148,15 +148,17 @@ loading), measured end to end at the Omni entrypoint.
 
 | NeuronCores | Configuration | DiT s/step | Text encoder | DiT (49 steps) | Video decoder | Audio decoder | Request |
 |---|---|---|---|---|---|---|---|
-| 64 | TP=8 x CP=8 | 1.429 | 0.16 s | 72.2 s | 13.9 s | 1.1 s | **89.2 s** |
+| 64 | TP=8 x CP=8 | 1.434 | 0.18 s | 72.4 s | 2.9 s | 1.0 s | **78.1 s** |
 | 32 | TP=8 x CP=4 | 2.547 | 5.0 s | 126.8 s | 15.8 s | 1.2 s | **151.1 s** |
 | 16 | TP=8 x CP=2 | 5.013 | 2.8 s | 257.9 s | 16.1 s | 1.2 s | **280.4 s** |
 | 8 | TP=8 | 12.694 | 4.4 s | 623.5 s | 19.2 s | 1.3 s | **650.5 s** |
 | 4 | TP=4 | — | — | — | — | — | does not fit (see below) |
 
-The 64-core row runs the conditioner's decoder layers on NeuronCores (the default there); with
-them on the host the same request took 98.6 s, the host encoder taking 0.9–6 s for the same
-prompt. Below 64 cores the conditioner is on the host.
+The 64-core row runs the conditioner on NeuronCores (the default there; with it on the host the
+request took 98.6 s, the host encoder taking 0.9–6 s for the same prompt) and gathers the decoded
+tiles through shared memory (13.0 s of video decoding before, 6.0 s of it pickling ~1 GB of
+tiles through the CPU group). The 8–32-core rows predate the shared-memory gather; below 64 cores
+the conditioner is on the host.
 
 `ref2va` at 1344x768 on 64 cores — an image, a 1-second video with its soundtrack and a 2-second
 audio clip (an 8243-token presentation, 60928 DiT rows) — takes **222.7 s** per request: 47.9 s to

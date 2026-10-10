@@ -48,6 +48,7 @@ count). Prompt-length bucketing needs a masked attention path first; until then,
 prompt lengths or accept the recompile.
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -917,14 +918,18 @@ class MiniMaxH3Pipeline(nn.Module):
         # not fit in HBM next to the decoder. float32 because a dtype cast on a device
         # tensor is something the Neuron backend refuses outright, so the dtype has
         # to be right before anything crosses over.
-        video = self.vae.decode(rows.to(torch.float32), return_dict=False)[0]
-        if video is None:
-            # Not rank 0: every rank decodes its share of the tiles, rank 0 assembles the clip.
-            return None
-        video = video.detach().to(device="cpu", dtype=torch.float32)
-        pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN).view(1, -1, 1, 1, 1)
-        pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD).view(1, -1, 1, 1, 1)
-        return (video * pixel_std + pixel_mean).clamp(0, 1)
+        # Rank 0 stitches and post-processes a ~1 GB clip on the host; the Lite worker pins every
+        # rank to one thread, so rank 0 (and only rank 0, to not oversubscribe) lifts it.
+        assembler = not dist.is_initialized() or dist.get_rank() == 0
+        with host_threads() if assembler else contextlib.nullcontext():
+            video = self.vae.decode(rows.to(torch.float32), return_dict=False)[0]
+            if video is None:
+                # Not rank 0: every rank decodes its share of the tiles, rank 0 assembles the clip.
+                return None
+            video = video.detach().to(device="cpu", dtype=torch.float32)
+            pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN).view(1, -1, 1, 1, 1)
+            pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD).view(1, -1, 1, 1, 1)
+            return (video * pixel_std + pixel_mean).clamp(0, 1)
 
     @torch.no_grad()
     def decode_audio(
