@@ -334,6 +334,7 @@ class MiniMaxH3Pipeline(nn.Module):
         self._transformer_compile_kwargs: dict | None = None
         self._compiled_transformer = None
         self._qwen_processor = None
+        self._pdd = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -343,6 +344,9 @@ class MiniMaxH3Pipeline(nn.Module):
         """Move every component to the target device."""
         # The conditioner stays on the host; see `text_encoder`.
         components = ["transformer", "vae"] + (["audio_vae"] if self._audio_on_neuron else [])
+        if os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1":
+            # The decoder is moved in around each decode instead (see `forward`).
+            components.remove("vae")
         for attr in components:
             component = getattr(self, attr, None)
             if component is not None:
@@ -369,6 +373,58 @@ class MiniMaxH3Pipeline(nn.Module):
             self.vae.load_weights(os.path.join(model, "vae"))
         if self.audio_vae is not None:
             self.audio_vae.load_weights(os.path.join(model, "audio_vae"))
+        self._pdd = None
+        pdd_path = os.environ.get("MINIMAX_H3_PDD_HEADS")
+        if pdd_path:
+            self._load_pdd_heads(pdd_path)
+
+    # ------------------------------------------------------------------
+    # PDD (Parallel Decoding Distillation, arXiv 2607.26004) few-step heads
+    # ------------------------------------------------------------------
+
+    def _load_pdd_heads(self, path: str) -> None:
+        """Load the per-interval output heads of a PDD checkpoint whose backbone LoRA has
+        already been merged into ``transformer/``.
+
+        PDD repeats ``proj_out`` / ``audio_proj_out`` once per interval of an ``N``-point
+        grid; one evaluation covers a block of ``L`` intervals with the step-size-weighted mean
+        of the block's heads. The fused head is a plain linear map, so it is formed on the host
+        each step and copied into the existing head parameters: the compiled graph is unchanged.
+        """
+        from safetensors import safe_open
+
+        with safe_open(path, "pt") as handle:
+            meta = handle.metadata()
+            heads = {key: handle.get_tensor(key).float() for key in handle.keys()}
+        num_steps, block = int(meta["pdd_num_steps"]), int(meta["pdd_block_size"])
+
+        def grid(shift: float) -> torch.Tensor:
+            sigma = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
+            return (1.0 - shift * sigma / (1 + (shift - 1) * sigma)).diff()
+
+        self._pdd = {
+            "heads": heads,
+            "block": block,
+            "nfe": num_steps // block,
+            "video_steps": grid(float(self.scheduler._shift)),
+            "audio_steps": grid(float(self.audio_scheduler._shift)),
+        }
+        logger.info("PDD heads loaded: grid=%d block=%d nfe=%d", num_steps, block, num_steps // block)
+
+    @torch.no_grad()
+    def _arm_pdd_heads(self, step_index: int, num_evals: int) -> None:
+        pdd = self._pdd
+        if num_evals != pdd["nfe"]:
+            raise ValueError(f"PDD heads need num_inference_steps={pdd['nfe'] + 1}, got {num_evals + 1}.")
+        start, block = step_index * pdd["block"], pdd["block"]
+        for name, steps in (("proj_out", pdd["video_steps"]), ("audio_proj_out", pdd["audio_steps"])):
+            weights = steps[start : start + block]
+            weights = (weights / weights.sum()).float()
+            fused_w = torch.einsum("n,noi->oi", weights, pdd["heads"][f"{name}.weight"][start : start + block])
+            fused_b = torch.einsum("n,no->o", weights, pdd["heads"][f"{name}.bias"][start : start + block])
+            layer = getattr(self.transformer, name)
+            layer.weight.data.copy_(fused_w.to(layer.weight.dtype))
+            layer.bias.data.copy_(fused_b.to(layer.bias.dtype))
 
     # ------------------------------------------------------------------
     # Compilation
@@ -410,8 +466,10 @@ class MiniMaxH3Pipeline(nn.Module):
         options["compiler_args"] = [
             "--model-type=transformer",
             "--auto-cast=none",
-            "-O1",
+            os.environ.get("MINIMAX_H3_DIT_OPT", "-O1"),
             "--hbm-scratchpad-page-size=2048",
+            # Extra DiT compiler flags for A/B runs, whitespace-separated, one token per flag.
+            *os.environ.get("MINIMAX_H3_DIT_EXTRA_FLAGS", "").split(),
         ]
         options["model_name"] = "minimax_h3_transformer"
         self._transformer_compile_kwargs = t_kwargs
@@ -790,6 +848,9 @@ class MiniMaxH3Pipeline(nn.Module):
         # This line is where every stage-level timing analysis finds the denoise window, so it
         # reports the steps that will actually run, not the schedule's length.
         num_steps = min(timesteps.numel(), audio_timesteps.numel())
+        if trace_steps is None and os.environ.get("MINIMAX_H3_TRACE_STEPS"):
+            # Accuracy runs: stop the schedule after N steps (the 2-step protocol of the docs).
+            trace_steps = int(os.environ["MINIMAX_H3_TRACE_STEPS"])
         if trace_steps is not None:
             num_steps = min(num_steps, trace_steps)
         logger.info(
@@ -816,6 +877,12 @@ class MiniMaxH3Pipeline(nn.Module):
             adaln_run_rows, _ = build_run_table_rows(runs, run_tags, timestep_indices)
             norm_out_run_rows = self._norm_out_run_rows(row_runs, timestep_indices)
 
+            adaln_partials = None
+            if getattr(self.transformer, "_adaln_cache", None) is not None:
+                adaln_partials = self.transformer.adaln_host_partials(step_timesteps).to(self.device)
+            if self._pdd is not None:
+                self._arm_pdd_heads(index, timesteps.numel())
+
             noise_pred, audio_noise_pred = transformer(
                 hidden_states=latents.unsqueeze(0).to(self.device),
                 audio_hidden_states=audio_latents.unsqueeze(0).to(self.device),
@@ -827,6 +894,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 norm_out_run_rows=norm_out_run_rows.to(self.device),
                 num_text_tokens=num_text_tokens,
                 row_runs=row_runs,
+                adaln_partials=adaln_partials,
             )
             noise_pred = noise_pred[0].detach().to(device="cpu", dtype=torch.float32)
             audio_noise_pred = audio_noise_pred[0].detach().to(
@@ -1283,6 +1351,14 @@ class MiniMaxH3Pipeline(nn.Module):
         if not self._decode:
             return DiffusionOutput(output=None)
 
+        # `MINIMAX_H3_SWAP_FOR_DECODE=1` (small instances): the DiT and the 4.8 GB replicated video
+        # decoder do not fit one 24 GB core together, so the decoder lives on the host during the
+        # denoise loop and the DiT weights on the host during decode.
+        swap = os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" and self.device.type != "cpu"
+        if swap:
+            with _stage("swap_in_vae"):
+                self.transformer.to("cpu")
+                self.vae.to(self.device)
         with _stage("decode_video"):
             video = self.decode_video(
                 video_rows,
@@ -1292,6 +1368,10 @@ class MiniMaxH3Pipeline(nn.Module):
                 latent_width,
                 output_type=output_type,
             )
+        if swap:
+            with _stage("swap_out_vae"):
+                self.vae.to("cpu")
+                self.transformer.to(self.device)
         with _stage("decode_audio"):
             audio = self.decode_audio(
                 audio_rows,

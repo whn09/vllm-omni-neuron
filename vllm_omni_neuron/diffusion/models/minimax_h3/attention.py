@@ -23,6 +23,8 @@ this path, which is within the 9% a bf16 run of the reference itself shows.
 
 from __future__ import annotations
 
+import os
+
 import nki
 import nki.language as nl
 import torch
@@ -135,3 +137,54 @@ def context_parallel_attention(query, key, value, scale, cp_group, key_start: to
     """
     key_value = cp_group.all_gather(torch.stack((key, value)).contiguous(), dim=2)
     return local_attention(query, key_value[0], key_value[1], scale, key_start, key_end)
+
+
+@nki.jit
+def _h3_attention_kernel_dmajor(q, k, v, bound_min, bound_max):
+    """`_h3_attention_kernel` with a d-major output: ``[BN, S, D]`` in, ``[BN, D, S]`` out."""
+    return attention_cte(
+        q=q,
+        k=k,
+        v=v,
+        scale=1.0,
+        causal_mask=False,
+        tp_q=True,
+        tp_k=True,
+        tp_out=True,
+        cache_softmax=False,
+        softmax_dtype=nl.float32,
+        mm_out_dtype=nl.float32,
+        bound_min=bound_min,
+        bound_max=bound_max,
+    )
+
+
+@nki_op("minimax_h3_transformer::attention_cte_dmajor")
+def _h3_nki_attention_dmajor(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bound_min: torch.Tensor,
+    bound_max: torch.Tensor,
+) -> torch.Tensor:
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    return wrap_nki(_h3_attention_kernel_dmajor)[_kernel_lnc()](q, k, v, bound_min, bound_max)
+
+
+def heads_first_attention_dmajor(query, key, value, key_start: torch.Tensor, key_end: int, cp_group=None):
+    """``attention_cte`` on heads-first ``[N, S, D]`` operands (batch 1, ``query`` pre-scaled).
+
+    Returns ``[N, D, S]``. Under CP, ``key``/``value`` are this rank's rows and are all-gathered
+    along the sequence in one collective.
+    """
+    if cp_group is not None:
+        key_value = cp_group.all_gather(torch.stack((key, value)), dim=2)
+        key, value = key_value[0], key_value[1]
+    N, S, D = query.shape
+    if os.environ.get("MINIMAX_H3_ABLATE", "") == "kernel":
+        # Timing ablation only (wrong numerics): no attention kernel.
+        return query.transpose(1, 2) * 1.0
+    bound_min = key_start.to(torch.int32).view(1, 1, 1).expand(N, S, 1).contiguous()
+    bound_max = torch.full_like(bound_min, key_end)
+    return _h3_nki_attention_dmajor(query, key, value, bound_min, bound_max)
