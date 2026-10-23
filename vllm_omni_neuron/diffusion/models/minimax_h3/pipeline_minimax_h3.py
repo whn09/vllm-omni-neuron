@@ -70,6 +70,7 @@ from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_minimax_h3_
     NeuronAutoencoderKLMiniMaxH3Audio,
 )
 from vllm_omni_neuron.diffusion.models.minimax_h3.audio_encoder import MiniMaxH3AudioEncoder
+from vllm_omni_neuron.diffusion.models.minimax_h3.decode_swap import TailEvictor, evict_blocks_setting
 from vllm_omni_neuron.diffusion.models.minimax_h3.keyframes import (
     collect_keyframes,
     fit_keyframes,
@@ -334,6 +335,10 @@ class MiniMaxH3Pipeline(nn.Module):
         self._transformer_compile_kwargs: dict | None = None
         self._compiled_transformer = None
         self._qwen_processor = None
+        self._pdd = None
+        # `MINIMAX_H3_EVICT_BLOCKS` (see `decode_swap`): built on the first decode.
+        self._dit_evictor = None
+        self._vae_evictor = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -343,13 +348,21 @@ class MiniMaxH3Pipeline(nn.Module):
         """Move every component to the target device."""
         # The conditioner stays on the host; see `text_encoder`.
         components = ["transformer", "vae"] + (["audio_vae"] if self._audio_on_neuron else [])
+        if os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" or evict_blocks_setting():
+            # The decoder is moved in around each decode instead (see `forward`).
+            components.remove("vae")
         for attr in components:
             component = getattr(self, attr, None)
             if component is not None:
                 component.to(*args, **kwargs)
         for module in (self.text_encoder.neuron_layers, self.text_encoder.neuron_vision):
-            if module is not None:
-                module.to(*args, **kwargs)
+            if module is None:
+                continue
+            if module is self.text_encoder.neuron_layers and getattr(module, "_stream", 0):
+                # `MINIMAX_H3_TE_STREAM`: the layers stay on the host and stream through the device.
+                module.set_stream_device(self.device)
+                continue
+            module.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
@@ -369,6 +382,58 @@ class MiniMaxH3Pipeline(nn.Module):
             self.vae.load_weights(os.path.join(model, "vae"))
         if self.audio_vae is not None:
             self.audio_vae.load_weights(os.path.join(model, "audio_vae"))
+        self._pdd = None
+        pdd_path = os.environ.get("MINIMAX_H3_PDD_HEADS")
+        if pdd_path:
+            self._load_pdd_heads(pdd_path)
+
+    # ------------------------------------------------------------------
+    # PDD (Parallel Decoding Distillation, arXiv 2607.26004) few-step heads
+    # ------------------------------------------------------------------
+
+    def _load_pdd_heads(self, path: str) -> None:
+        """Load the per-interval output heads of a PDD checkpoint whose backbone LoRA has
+        already been merged into ``transformer/``.
+
+        PDD repeats ``proj_out`` / ``audio_proj_out`` once per interval of an ``N``-point
+        grid; one evaluation covers a block of ``L`` intervals with the step-size-weighted mean
+        of the block's heads. The fused head is a plain linear map, so it is formed on the host
+        each step and copied into the existing head parameters: the compiled graph is unchanged.
+        """
+        from safetensors import safe_open
+
+        with safe_open(path, "pt") as handle:
+            meta = handle.metadata()
+            heads = {key: handle.get_tensor(key).float() for key in handle.keys()}
+        num_steps, block = int(meta["pdd_num_steps"]), int(meta["pdd_block_size"])
+
+        def grid(shift: float) -> torch.Tensor:
+            sigma = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
+            return (1.0 - shift * sigma / (1 + (shift - 1) * sigma)).diff()
+
+        self._pdd = {
+            "heads": heads,
+            "block": block,
+            "nfe": num_steps // block,
+            "video_steps": grid(float(self.scheduler._shift)),
+            "audio_steps": grid(float(self.audio_scheduler._shift)),
+        }
+        logger.info("PDD heads loaded: grid=%d block=%d nfe=%d", num_steps, block, num_steps // block)
+
+    @torch.no_grad()
+    def _arm_pdd_heads(self, step_index: int, num_evals: int) -> None:
+        pdd = self._pdd
+        if num_evals != pdd["nfe"]:
+            raise ValueError(f"PDD heads need num_inference_steps={pdd['nfe'] + 1}, got {num_evals + 1}.")
+        start, block = step_index * pdd["block"], pdd["block"]
+        for name, steps in (("proj_out", pdd["video_steps"]), ("audio_proj_out", pdd["audio_steps"])):
+            weights = steps[start : start + block]
+            weights = (weights / weights.sum()).float()
+            fused_w = torch.einsum("n,noi->oi", weights, pdd["heads"][f"{name}.weight"][start : start + block])
+            fused_b = torch.einsum("n,no->o", weights, pdd["heads"][f"{name}.bias"][start : start + block])
+            layer = getattr(self.transformer, name)
+            layer.weight.data.copy_(fused_w.to(layer.weight.dtype))
+            layer.bias.data.copy_(fused_b.to(layer.bias.dtype))
 
     # ------------------------------------------------------------------
     # Compilation
@@ -410,8 +475,10 @@ class MiniMaxH3Pipeline(nn.Module):
         options["compiler_args"] = [
             "--model-type=transformer",
             "--auto-cast=none",
-            "-O1",
+            os.environ.get("MINIMAX_H3_DIT_OPT", "-O1"),
             "--hbm-scratchpad-page-size=2048",
+            # Extra DiT compiler flags for A/B runs, whitespace-separated, one token per flag.
+            *os.environ.get("MINIMAX_H3_DIT_EXTRA_FLAGS", "").split(),
         ]
         options["model_name"] = "minimax_h3_transformer"
         self._transformer_compile_kwargs = t_kwargs
@@ -762,6 +829,11 @@ class MiniMaxH3Pipeline(nn.Module):
             layout, text_bucket_length(num_text, media_length, self._text_bucket_align)
         )
         runs, run_tags = order.runs(layout)
+        if os.environ.get("MINIMAX_H3_ATTN_MASK_FIRST_TILE", "0") == "1" and order.num_text_pad >= 512:
+            raise ValueError(
+                f"MINIMAX_H3_ATTN_MASK_FIRST_TILE needs the prompt padding below 512 rows, got "
+                f"{order.num_text_pad}; use text_bucket_align <= 512."
+            )
         row_runs = MiniMaxH3RowRuns(
             num_text_rows=order.num_text_rows,
             num_condition_rows=num_condition_video_rows,
@@ -777,8 +849,19 @@ class MiniMaxH3Pipeline(nn.Module):
             self.transformer_config.rope_freq_dim,
             self.transformer_config.rope_theta,
         )
-        rotary_cos = order.rows(rotary_cos).to(self.device)
-        rotary_sin = order.rows(rotary_sin).to(self.device)
+        rotary_cos = order.rows(rotary_cos)
+        rotary_sin = order.rows(rotary_sin)
+        if getattr(self.transformer, "rope_rotate", None) is not None:
+            # `MINIMAX_H3_ROPE_MATMUL`: pad the tables to the full head width here, once per
+            # request, and hand the device-resident rotate matrix to the blocks.
+            from vllm_omni_neuron.diffusion.models.minimax_h3.minimax_h3_transformer import rope_full_width_tables
+
+            rotary_cos, rotary_sin = rope_full_width_tables(
+                rotary_cos, rotary_sin, self.transformer.config.attention_head_dim
+            )
+            self.transformer.prepare_rope_matrix()
+        rotary_cos = rotary_cos.to(self.device)
+        rotary_sin = rotary_sin.to(self.device)
         prompt_embeds = prompt_embeds.to("cpu")
         prompt_embeds = torch.cat(
             [prompt_embeds.new_zeros((1, order.num_text_pad, prompt_embeds.shape[-1])), prompt_embeds],
@@ -790,6 +873,9 @@ class MiniMaxH3Pipeline(nn.Module):
         # This line is where every stage-level timing analysis finds the denoise window, so it
         # reports the steps that will actually run, not the schedule's length.
         num_steps = min(timesteps.numel(), audio_timesteps.numel())
+        if trace_steps is None and os.environ.get("MINIMAX_H3_TRACE_STEPS"):
+            # Accuracy runs: stop the schedule after N steps (the 2-step protocol of the docs).
+            trace_steps = int(os.environ["MINIMAX_H3_TRACE_STEPS"])
         if trace_steps is not None:
             num_steps = min(num_steps, trace_steps)
         logger.info(
@@ -820,6 +906,12 @@ class MiniMaxH3Pipeline(nn.Module):
             adaln_run_rows, _ = build_run_table_rows(runs, run_tags, timestep_indices)
             norm_out_run_rows = self._norm_out_run_rows(row_runs, timestep_indices)
 
+            adaln_partials = None
+            if getattr(self.transformer, "_adaln_cache", None) is not None:
+                adaln_partials = self.transformer.adaln_host_partials(step_timesteps).to(self.device)
+            if self._pdd is not None:
+                self._arm_pdd_heads(index, timesteps.numel())
+
             noise_pred, audio_noise_pred = transformer(
                 hidden_states=latents.unsqueeze(0).to(self.device),
                 audio_hidden_states=audio_latents.unsqueeze(0).to(self.device),
@@ -831,6 +923,7 @@ class MiniMaxH3Pipeline(nn.Module):
                 norm_out_run_rows=norm_out_run_rows.to(self.device),
                 num_text_tokens=num_text_tokens,
                 row_runs=row_runs,
+                adaln_partials=adaln_partials,
                 **sp_inputs,
             )
             noise_pred = noise_pred[0].detach().to(device="cpu", dtype=torch.float32)
@@ -1229,6 +1322,10 @@ class MiniMaxH3Pipeline(nn.Module):
             )
             self.vae.use_tiling = True
 
+        if self._dit_evictor is not None and self._dit_evictor.reload_mode == "next_request":
+            # Overlap the evicted tail's copy back with the host-side prompt encode.
+            self._dit_evictor.start_prefetch()
+
         geometry = (num_latent_frames, latent_height, latent_width, num_audio_latents)
         condition_latents, audio_condition_rows = [], None
         if references:
@@ -1239,6 +1336,15 @@ class MiniMaxH3Pipeline(nn.Module):
         else:
             with _stage("encode_prompt"):
                 prompt_embeds, token_tags = self.encode_prompt(prompt, keyframes=keyframes)
+            layers = self.text_encoder.neuron_layers
+            if layers is not None and getattr(layers, "_stream", 0) and _profiling_stages():
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    logger.info(
+                        "H3 text encoder: %d tokens, 50 layers streamed %d at a time in %.2f s.",
+                        prompt_embeds.shape[1],
+                        layers._stream,
+                        layers.last_stream_seconds,
+                    )
             with _stage("pack_layout"):
                 layout = build_packed_sequence(
                     text_token_tags=token_tags,
@@ -1274,6 +1380,9 @@ class MiniMaxH3Pipeline(nn.Module):
         if audio_condition_rows is not None:
             audio_rows = torch.cat([audio_condition_rows.to(audio_rows.dtype), audio_rows])
 
+        if self._dit_evictor is not None:
+            with _stage("reload_wait"):
+                self._dit_evictor.wait()
         with _stage("denoise"):
             video_rows, audio_rows = self.denoise(
                 prompt_embeds, video_rows, audio_rows, layout, num_inference_steps
@@ -1288,6 +1397,27 @@ class MiniMaxH3Pipeline(nn.Module):
         if not self._decode:
             return DiffusionOutput(output=None)
 
+        # `MINIMAX_H3_SWAP_FOR_DECODE=1` (small instances): the DiT and the 4.8 GB replicated video
+        # decoder do not fit one 24 GB core together, so the decoder lives on the host during the
+        # denoise loop and the DiT weights on the host during decode.
+        evict = evict_blocks_setting() if self.device.type != "cpu" else None
+        swap = not evict and os.environ.get("MINIMAX_H3_SWAP_FOR_DECODE", "0") == "1" and self.device.type != "cpu"
+        if evict:
+            # `MINIMAX_H3_EVICT_BLOCKS`: drop the DiT tail's device storage (a host copy is kept)
+            # and bring the decoder in from its own host copy. See `decode_swap`.
+            with _stage("swap_in_vae"):
+                if self._dit_evictor is None:
+                    self._dit_evictor = TailEvictor(self.transformer, evict, self.device)
+                    self._dit_evictor.snapshot()
+                    self._vae_evictor = TailEvictor(self.vae, "all_module", self.device)
+                    self._vae_evictor.snapshot()
+                    self._vae_evictor.evict()
+                self._dit_evictor.evict()
+                self._vae_evictor.reload()
+        if swap:
+            with _stage("swap_in_vae"):
+                self.transformer.to("cpu")
+                self.vae.to(self.device)
         with _stage("decode_video"):
             video = self.decode_video(
                 video_rows,
@@ -1297,6 +1427,15 @@ class MiniMaxH3Pipeline(nn.Module):
                 latent_width,
                 output_type=output_type,
             )
+        if evict:
+            with _stage("swap_out_vae"):
+                self._vae_evictor.evict()
+                if self._dit_evictor.reload_mode == "after_decode":
+                    self._dit_evictor.reload()
+        if swap:
+            with _stage("swap_out_vae"):
+                self.vae.to("cpu")
+                self.transformer.to(self.device)
         with _stage("decode_audio"):
             audio = self.decode_audio(
                 audio_rows,

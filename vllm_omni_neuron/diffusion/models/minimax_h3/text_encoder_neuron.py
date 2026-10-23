@@ -34,6 +34,19 @@ from nkilib.core.attention.attention_cte import attention_cte
 from vllm_omni_neuron.diffusion.models.wan2_2.wan2_2_transformer import _kernel_lnc
 from vllm_omni_neuron.lite_compat import nki_op
 
+#: `MINIMAX_H3_TE_STREAM=<n>` (single device): the 50 layers' shards (~12 GB per rank at TP4) do not
+#: fit beside the DiT, so they stay on the host and are streamed through the device ``n`` layers at a
+#: time. The next chunk is copied while the current one runs, so ~2n layers are resident at the peak.
+STREAM_ENV = "MINIMAX_H3_TE_STREAM"
+#: `MINIMAX_H3_TE_PIN=1`: page-lock the host shards. Not recommended on a trn2.3xlarge: locking ~48 GB
+#: of the 124 GB host pushed the rest of the process into swap (16 s encodes, against 3.6 s unpinned).
+PIN_ENV = "MINIMAX_H3_TE_PIN"
+
+
+def stream_chunk() -> int:
+    return int(os.environ.get(STREAM_ENV, "0") or 0)
+
+
 #: Prompt rows are padded to a multiple of this, so every prompt up to it shares one graph.
 TEXT_BUCKET = 512
 #: Layers whose output conditions the DiT (``hidden_states[50]``).
@@ -165,6 +178,10 @@ class NeuronQwen3VLTextLayers(nn.Module):
             for _ in range(NUM_LAYERS)
         )
         self._compiled = None
+        self._stream = stream_chunk()
+        self._stream_device = None
+        self._host: dict[tuple[int, str], torch.Tensor] = {}
+        self.last_stream_seconds = 0.0
 
     @torch.no_grad()
     def load_weights(self, dtype=torch.bfloat16) -> None:
@@ -203,6 +220,36 @@ class NeuronQwen3VLTextLayers(nn.Module):
             }
             for name, value in values.items():
                 getattr(layer, name).data = value.to(dtype).contiguous()
+        if self._stream:
+            pin = os.environ.get(PIN_ENV, "0") == "1"
+            for index_, layer in enumerate(self.layers):
+                for name, param in layer.named_parameters():
+                    host = param.data
+                    if pin:
+                        try:
+                            host = host.pin_memory()
+                        except RuntimeError:
+                            pass
+                    self._host[(index_, name)] = host
+
+    def set_stream_device(self, device) -> None:
+        """Streaming: where the layers run. The module itself stays on the host."""
+        self._stream_device = torch.device(device)
+
+    @property
+    def device(self) -> torch.device:
+        if self._stream:
+            return self._stream_device or torch.device("cpu")
+        return next(self.parameters()).device
+
+    def _place(self, start: int, stop: int, device) -> None:
+        """Point layers ``[start, stop)`` at device copies (``device``) or back at the host copies."""
+        for index_ in range(start, stop):
+            layer = self.layers[index_]
+            for name in list(layer._parameters):
+                host = self._host[(index_, name)]
+                value = host if device is None else host.to(device)
+                layer._parameters[name] = nn.Parameter(value, requires_grad=False)
 
     def compile(self, compile_fn) -> None:
         import torch._dynamo.config as dynamo_config
@@ -213,6 +260,8 @@ class NeuronQwen3VLTextLayers(nn.Module):
     def forward(self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, deepstack: list[torch.Tensor]):
         """``(1, S, hidden)`` -> ``hidden_states[50]``; ``deepstack[i]`` is added after layer ``i``."""
         layers = self._compiled or [_Probed(layer) for layer in self.layers]
+        if self._stream:
+            return self._forward_streamed(layers, hidden, cos, sin, deepstack)
         pending = []
         for index, layer in enumerate(layers):
             if index < len(deepstack):
@@ -224,4 +273,34 @@ class NeuronQwen3VLTextLayers(nn.Module):
                 pending.pop(0).to("cpu")
         for probe in pending:
             probe.to("cpu")
+        return hidden
+
+    def _forward_streamed(self, layers, hidden, cos, sin, deepstack):
+        """Run the layers ``self._stream`` at a time: copy chunk ``i + 1`` in while chunk ``i`` runs,
+        then retire chunk ``i``'s launches and drop its device copies."""
+        import time
+
+        started = time.perf_counter()
+        n, device = self._stream, self.device
+        chunks = [(start, min(start + n, NUM_LAYERS)) for start in range(0, NUM_LAYERS, n)]
+        self._place(*chunks[0], device)
+        for position, (start, stop) in enumerate(chunks):
+            probes = []
+            for index in range(start, stop):
+                if index < len(deepstack):
+                    hidden, probe = layers[index](hidden, cos, sin, deepstack[index])
+                else:
+                    hidden, probe = layers[index](hidden, cos, sin)
+                probes.append(probe)
+                # The Lite runtime's execution queue holds ~8 launches; retire as we go.
+                while len(probes) > _MAX_IN_FLIGHT:
+                    probes.pop(0).to("cpu")
+                if index == start and position + 1 < len(chunks):
+                    # Copy the next chunk in while this one runs.
+                    self._place(*chunks[position + 1], device)
+            # A launch must be retired before the weights it reads are released.
+            for probe in probes:
+                probe.to("cpu")
+            self._place(start, stop, None)
+        self.last_stream_seconds = time.perf_counter() - started
         return hidden

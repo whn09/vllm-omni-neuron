@@ -97,7 +97,8 @@ class MiniMaxH3TextEncoder:
         self.video_token_id = config.video_token_id
         if self.device == "auto":
             world_size = _world().world_size if dist.is_initialized() else 1
-            self.device = "neuron" if world_size == _NEURON_AUTO_WORLD else "cpu"
+            streaming = int(os.environ.get("MINIMAX_H3_TE_STREAM", "0") or 0) > 0
+            self.device = "neuron" if world_size == _NEURON_AUTO_WORLD or streaming else "cpu"
         if self.device == "neuron":
             from vllm_omni_neuron.diffusion.models.minimax_h3.text_encoder_neuron import (
                 NeuronQwen3VLTextLayers,
@@ -116,6 +117,8 @@ class MiniMaxH3TextEncoder:
                 group,
             )
             self.neuron_layers.load_weights(self.dtype)
+        if self.device == "neuron" and not getattr(self.neuron_layers, "_stream", 0):
+            # Streaming (single device) keeps the vision tower on the host: no HBM to spare for it.
             from vllm_omni_neuron.diffusion.models.minimax_h3.vision_neuron import (
                 NeuronQwen3VLVisionBlocks,
             )
@@ -346,7 +349,7 @@ class MiniMaxH3TextEncoder:
         return hidden.to("cpu")[:, :length].to(self.dtype).contiguous()
 
     def _neuron_device(self):
-        return next(self.neuron_layers.parameters()).device
+        return self.neuron_layers.device
 
     def encode(self, token_ids: list[int], vision_inputs: dict | None = None) -> torch.Tensor:
         """``(1, len(token_ids), hidden_size)`` conditioning on the host, identical on every rank.
