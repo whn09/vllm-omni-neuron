@@ -127,11 +127,23 @@ def _zero_kv_pad(k_buf, v_buf, seqlen, seq_padded, head_dim, runs, allocator):
     allocator.set_current_address(scratch_addr)
 
 
+_KV_TWO_CHANNELS = __import__("os").environ.get("MINIMAX_H3_RING_KV_CHANNELS", "1") == "2"
+
+
 def _issue_kv_permute(cur_k, nxt_k, cur_v, nxt_v, replica_group):
     """Issue the K and V ring collective-permutes for one ring step.
 
     Reads cur_k/cur_v (the just-received buffers) and writes nxt_k/nxt_v.
     """
+    if _KV_TWO_CHANNELS:
+        # `MINIMAX_H3_RING_KV_CHANNELS=2`: K on channel 0 and V on channel 1 in one permute.
+        # Experimental: fails to trace for H3's CP8 replica groups on trn2 (2026-10-22); keep off.
+        ncc.collective_permute_implicit(
+            srcs_by_channel=[[cur_k], [cur_v]],
+            dsts_by_channel=[[nxt_k], [nxt_v]],
+            replica_group=replica_group,
+        )
+        return
     ncc.collective_permute_implicit(
         srcs_by_channel=[[cur_k]],
         dsts_by_channel=[[nxt_k]],
