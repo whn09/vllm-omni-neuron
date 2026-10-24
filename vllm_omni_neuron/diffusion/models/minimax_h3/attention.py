@@ -26,9 +26,12 @@ Context parallelism runs one of two cores, chosen per block from its QK-norm gai
 
 from __future__ import annotations
 
+import os
+
 import nki
 import nki.language as nl
 import torch
+import torch.nn.functional as F
 from nkilib.core.attention.attention_cte import attention_cte
 
 from vllm_omni_neuron.diffusion.models.wan2_2.wan2_2_transformer import (
@@ -41,6 +44,12 @@ from vllm_omni_neuron.lite_compat import nki_op
 _ATTN_MAX_BS = 512
 _ATTN_MAX_SEQLEN = 131072
 _ATTN_MAX_HEAD_DIM = 128
+
+# `MINIMAX_H3_ATTN_PSUM_BF16=1` (trn3 / NeuronCore-v4 only; the kernel rejects it on trn2): bf16
+# PSUM for attention_cte's QK^T and PV accumulators (`mm_out_dtype`), halving the bytes the row-max
+# evict and MM2 accumulate move through PSUM.
+_MM_OUT_DTYPE = nl.bfloat16 if os.environ.get("MINIMAX_H3_ATTN_PSUM_BF16", "0") == "1" else nl.float32
+
 
 #: Largest score bound (nats) a block may have to run the const-max ring kernel.
 RING_MAX_SCORE_NATS = 255.0
@@ -74,7 +83,7 @@ def _h3_attention_kernel(q, k, v, bound_min, bound_max):
         tp_out=False,
         cache_softmax=False,
         softmax_dtype=nl.float32,
-        mm_out_dtype=nl.float32,
+        mm_out_dtype=_MM_OUT_DTYPE,
         bound_min=bound_min,
         bound_max=bound_max,
     )
@@ -114,6 +123,20 @@ def can_run_ring_attention(query: torch.Tensor) -> bool:
 
 def _torch_attend(query, key, value, scale, key_start=None, key_end=None):
     """``softmax(scale Q K^T) V`` over the keys ``[key_start, key_end)``; token-major ``[B, S, N, D]``."""
+    if query.device.type == "cpu" and query.shape[1] * key.shape[1] > (1 << 26):
+        # CPU reference path at full size: slice the keys to [key_start, key_end) (exact: the masked
+        # keys get zero weight) and run SDPA over head chunks, never materializing the S x S scores.
+        start = int(key_start.reshape(-1)[0]) if key_start is not None else 0
+        end = key_end if key_end is not None else key.shape[1]
+        q, k, v = (t.transpose(1, 2) for t in (query, key[:, start:end], value[:, start:end]))
+        out = torch.cat(
+            [
+                F.scaled_dot_product_attention(q[:, h : h + 1].float(), k[:, h : h + 1].float(), v[:, h : h + 1].float(), scale=scale)
+                for h in range(q.shape[1])
+            ],
+            dim=1,
+        )
+        return out.transpose(1, 2).to(query.dtype)
     q, k, v = (t.transpose(1, 2).float() for t in (query, key, value))
     scores = torch.matmul(q * scale, k.transpose(-2, -1))
     if key_start is not None:
@@ -196,3 +219,81 @@ def ring_attention(
     num_pad = (num_workers * S - key_end) + key_start.float()
     out = out.float() / (1.0 - num_pad * torch.exp(-lse)).unsqueeze(-1)
     return out.to(query.dtype).transpose(1, 2)
+
+
+# `MINIMAX_H3_ATTN_MASK_FIRST_TILE=1`: use the vendored copy of nkilib `attention_cte` (2.32) whose
+# sequence-packing mask is skipped for K tiles at or beyond 512. H3's key bounds are
+# ``[key_start, seqlen)`` with ``key_start`` < 512 (the prompt bucket's left padding), so only the first
+# K tile can hold masked keys; the result is bit-identical and the per-tile range_select is saved on
+# every other tile.
+_MASK_FIRST_TILE = os.environ.get("MINIMAX_H3_ATTN_MASK_FIRST_TILE", "0") == "1"
+if _MASK_FIRST_TILE:
+    from vllm_omni_neuron.kernels.nkilib.experimental.attention.attention_cte_h3 import (
+        attention_cte as _attention_cte_dmajor_impl,
+    )
+else:
+    _attention_cte_dmajor_impl = attention_cte
+
+
+@nki.jit
+def _h3_attention_kernel_dmajor(q, k, v, bound_min, bound_max):
+    """`_h3_attention_kernel` with a d-major output: ``[BN, S, D]`` in, ``[BN, D, S]`` out."""
+    return _attention_cte_dmajor_impl(
+        q=q,
+        k=k,
+        v=v,
+        scale=1.0,
+        causal_mask=False,
+        tp_q=True,
+        tp_k=True,
+        tp_out=True,
+        cache_softmax=False,
+        softmax_dtype=nl.float32,
+        mm_out_dtype=_MM_OUT_DTYPE,
+        bound_min=bound_min,
+        bound_max=bound_max,
+    )
+
+
+@nki_op("minimax_h3_transformer::attention_cte_dmajor")
+def _h3_nki_attention_dmajor(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bound_min: torch.Tensor,
+    bound_max: torch.Tensor,
+) -> torch.Tensor:
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    return wrap_nki(_h3_attention_kernel_dmajor)[_kernel_lnc()](q, k, v, bound_min, bound_max)
+
+
+def heads_first_attention_dmajor(query, key, value, key_start: torch.Tensor, key_end: int, cp_group=None):
+    """``attention_cte`` on heads-first ``[N, S, D]`` operands (batch 1, ``query`` pre-scaled).
+
+    Returns ``[N, D, S]``. Under CP, ``key``/``value`` are this rank's rows and are all-gathered
+    along the sequence in one collective.
+    """
+    if cp_group is not None:
+        key_value = cp_group.all_gather(torch.stack((key, value)), dim=2)
+        key, value = key_value[0], key_value[1]
+    N, S, D = query.shape
+    if os.environ.get("MINIMAX_H3_ABLATE", "") == "kernel":
+        # Timing ablation only (wrong numerics): no attention kernel.
+        return query.transpose(1, 2) * 1.0
+    group = int(os.environ.get("MINIMAX_H3_ATTN_HEADS_PER_CALL", "0")) or N
+    bound_min = key_start.to(torch.int32).view(1, 1, 1).expand(group, S, 1).contiguous()
+    bound_max = torch.full_like(bound_min, key_end)
+    if group >= N:
+        return _h3_nki_attention_dmajor(query, key, value, bound_min, bound_max)
+    # `MINIMAX_H3_ATTN_HEADS_PER_CALL`: one kernel launch per group of heads. At 37,888 rows, 2 heads
+    # per call measured 73 TF/s against 62 TF/s for all 14 in one call (less dI/dt throttling).
+    return torch.cat(
+        [
+            _h3_nki_attention_dmajor(
+                query[i : i + group], key[i : i + group], value[i : i + group], bound_min, bound_max
+            )
+            for i in range(0, N, group)
+        ],
+        dim=0,
+    )

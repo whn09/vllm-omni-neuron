@@ -294,6 +294,10 @@ def _process_kv_tiles_pipelined(
     # subtract's cost tracks the `shifted` precision, and `shifted` is fp16, which leaves Vector the
     # lighter of the pair -- so the copy goes there. It is ~3.4x cheaper there than on GpSimd.
     copy_engine = nisa.engine.vector
+    # `MINIMAX_H3_RING_ALT_COPY=1`: alternate the per-tile [V|1] copy between Vector and GpSimd by
+    # tile index (the balancing that gave Zyphra's seqpack zero-fill 1.18-1.27x). Tests whether GpSimd
+    # has slack once the ring's K/V transfers are handed to the CC engines (see the note above).
+    alt_copy = __import__("os").environ.get("MINIMAX_H3_RING_ALT_COPY", "0") == "1"
 
     # Number of MM1+exp tiles computed before first MM2 fires. Gives TensorE
     # a buffer of ready probabilities so it can always issue MM2 without waiting. Bounded by the
@@ -364,7 +368,7 @@ def _process_kv_tiles_pipelined(
                 nisa.tensor_copy(
                     dst=v_aug_all[rows, v_buf, :d],
                     src=v_block[local_tile, 0].data,
-                    engine=copy_engine,
+                    engine=(nisa.engine.gpsimd if alt_copy and kv_tile_idx % 2 == 1 else copy_engine),
                 )
 
                 # Padded-KV mask. When the caller padded Sk up to a 128-multiple with ZEROED tokens,

@@ -103,6 +103,32 @@ python examples/minimax_h3/run.py --model-path MiniMaxAI/MiniMax-H3 \
   --reference image:character.png --reference video:motion.mp4 --reference audio:voice.wav
 ```
 
+### Few-step distilled variants (optional)
+
+Two community step-distillation LoRAs run with no graph change. Each is folded into a copy of the
+checkpoint offline; shapes and dtypes stay the same, so the base model's NEFFs are reused. Neither
+is published by MiniMax, and output quality differs from the 50-step base model, so pick by
+evaluating samples for your use case.
+
+| Variant | LoRA | Evaluations | Run with |
+|---|---|---:|---|
+| PDD8 | `alibaba-pai/MiniMax-H3-Acc-LoRAs` (`MiniMax-H3-FL2VA-Acc-8Step`) | 8 | `--steps 9`, `MINIMAX_H3_PDD_HEADS=<out>/pdd_heads.safetensors` |
+| Turbo-4 | `lightx2v/Minimax-h3-Turbo` (`minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16`) | 4 | `--steps 5`, `flow_shift: 6.0` in the stage yaml (audio keeps 3.0) |
+
+```bash
+# PDD8
+python examples/minimax_h3/tools/merge_fewstep_lora.py pdd MiniMax-H3 MiniMax-H3-FL2VA-Acc-8Step.safetensors MiniMax-H3-PDD8
+MINIMAX_H3_PDD_HEADS=MiniMax-H3-PDD8/pdd_heads.safetensors \
+  python examples/minimax_h3/run.py --model-path MiniMax-H3-PDD8 --steps 9 ...
+# Turbo-4
+python examples/minimax_h3/tools/merge_fewstep_lora.py lora MiniMax-H3 minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors MiniMax-H3-T4
+python examples/minimax_h3/run.py --model-path MiniMax-H3-T4 --steps 5 --stage-config <yaml with flow_shift: 6.0> ...
+```
+
+Measured on one trn2.3xlarge-class device (TP=4, 1344x768, 124 frames), warm: PDD8 145 s and
+Turbo-4 83 s per request. The same seed gives different but valid scenes across the two variants
+and the base model.
+
 ### Prompt-length buckets
 
 The DiT graph specializes on the packed sequence length, which includes the prompt. The prompt is

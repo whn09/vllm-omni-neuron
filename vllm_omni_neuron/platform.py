@@ -91,7 +91,8 @@ class NeuronOmniPlatform(OmniPlatform, NeuronPlatform):
     @classmethod
     def get_device_count(cls) -> int:
         if envs.VLLM_NEURON_CPU_MODE:
-            return 0
+            # One "device" per process so torch.distributed rank % count works (CPU reference runs).
+            return 1
         if is_lite_runtime():
             return lite_device_count()
         return NeuronPlatform.device_count()
